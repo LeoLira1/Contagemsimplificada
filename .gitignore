@@ -1,0 +1,12 @@
+# Artefatos gerados pelo Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+
+# O projeto Android é gerado pelo CI (flutter create no build.yml) para não
+# versionar binários como o gradle-wrapper.jar — mesma escolha do repositório
+# Gondolas.
+android/
+ios/

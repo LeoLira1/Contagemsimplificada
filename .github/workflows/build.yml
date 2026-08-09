@@ -1,0 +1,99 @@
+name: Build & Release APK
+
+on:
+  push:
+    branches:
+      - main
+      - "claude/app-contagem-produtos-2ow1fr"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Scaffold Android project structure
+        # Gera o projeto Android padrão do Flutter num diretório temporário e
+        # copia apenas a pasta android/ para o workspace, como no repositório
+        # Gondolas. Assim nenhum binário (gradle-wrapper.jar) entra no git.
+        run: |
+          flutter create \
+            --org com.camda \
+            --project-name contagem_camda \
+            /tmp/scaffold
+
+          MANIFEST=/tmp/scaffold/android/app/src/main/AndroidManifest.xml
+
+          # Nome que aparece embaixo do ícone no celular.
+          sed -i \
+            's/android:label="contagem_camda"/android:label="Contagem CAMDA"/' \
+            "$MANIFEST"
+
+          # O app é 100% online (conexão remota ao Turso, sem réplica local):
+          # sem estas permissões o DNS falha em release e a lista nunca carrega.
+          grep -q 'android.permission.INTERNET' "$MANIFEST" || \
+            sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <application|' \
+              "$MANIFEST"
+
+          cp -r /tmp/scaffold/android .
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Run tests
+        run: flutter test
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Build APK release
+        # TODO: configurar um keystore fixo via secrets para evitar o erro
+        # "App não foi instalado" ao atualizar (a assinatura muda a cada build).
+        # Secrets necessários: KEYSTORE_BASE64, KEY_ALIAS, KEY_PASSWORD, STORE_PASSWORD
+        run: flutter build apk --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contagem-camda-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "build-${{ github.run_number }}"
+          name: "Contagem CAMDA #${{ github.run_number }}"
+          body: |
+            ## Contagem CAMDA — conferência de produtos na loja
+
+            Lista de contagem vinda da aba **Contagem** do dashboard
+            `camda-estoque`, cruzada com as posições cadastradas no app
+            `Gondolas`. Confirma OK ou registra divergência direto no banco.
+
+            **Primeiro uso:** abra o app e informe a URL + token do Turso
+            (os mesmos do dashboard e do app das gôndolas).
+
+            **Build:** #${{ github.run_number }} | Branch: `${{ github.ref_name }}`
+          files: build/app/outputs/flutter-apk/app-release.apk
+          make_latest: true

@@ -1,0 +1,30 @@
+name: contagem_camda
+description: App de contagem de produtos da loja CAMDA — lista do dashboard de estoque cruzada com as posições das gôndolas
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  libsql_dart: ^0.9.0
+  shared_preferences: ^2.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.3
+
+flutter:
+  uses-material-design: true
+
+# Ícone do app (icone.png na raiz). O projeto Android é gerado pelo CI
+# (flutter create no build.yml), então os mipmaps são gerados lá com
+# `dart run flutter_launcher_icons` logo após o scaffold.
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "icone.png"
