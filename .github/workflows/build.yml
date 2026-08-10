@@ -54,6 +54,17 @@ jobs:
 
           cp -r /tmp/scaffold/android .
 
+      - name: Configurar assinatura de release
+        # Precisa rodar DEPOIS do scaffold (é ele que cria o android/) e ANTES
+        # do build. Sem os secrets, avisa e deixa seguir com a chave de debug.
+        id: assinatura
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        run: python3 tool/configurar_assinatura.py
+
       - name: Install dependencies
         run: flutter pub get
 
@@ -67,10 +78,25 @@ jobs:
         run: dart run flutter_launcher_icons
 
       - name: Build APK release
-        # TODO: configurar um keystore fixo via secrets para evitar o erro
-        # "App não foi instalado" ao atualizar (a assinatura muda a cada build).
-        # Secrets necessários: KEYSTORE_BASE64, KEY_ALIAS, KEY_PASSWORD, STORE_PASSWORD
         run: flutter build apk --release
+
+      - name: Conferir a assinatura do APK
+        # A impressão digital do certificado vai para o corpo da release. É o
+        # que permite conferir, de um build para o outro, que a assinatura NÃO
+        # mudou — que é justamente o que quebra a atualização por cima.
+        id: cert
+        run: |
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs \
+            build/app/outputs/flutter-apk/app-release.apk | tee /tmp/certs.txt
+
+          FP=$(grep -m1 'certificate SHA-256 digest' /tmp/certs.txt \
+               | awk '{print $NF}')
+          echo "fingerprint=${FP:-desconhecida}" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ steps.assinatura.outputs.assinado }}" != "true" ]; then
+            echo "::warning::APK assinado com a chave de DEBUG — atualizar por cima vai falhar."
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -93,6 +119,12 @@ jobs:
 
             **Primeiro uso:** abra o app e informe a URL + token do Turso
             (os mesmos do dashboard e do app das gôndolas).
+
+            ${{ steps.assinatura.outputs.assinado == 'true'
+                && '**Assinatura:** chave fixa do repositório — dá para instalar por cima da versão anterior.'
+                || '⚠️ **Assinatura de DEBUG** (secrets não configurados): atualizar por cima vai falhar com "App não foi instalado". Desinstale a versão anterior antes.' }}
+
+            `SHA-256: ${{ steps.cert.outputs.fingerprint }}`
 
             **Build:** #${{ github.run_number }} | Branch: `${{ github.ref_name }}`
           files: build/app/outputs/flutter-apk/app-release.apk

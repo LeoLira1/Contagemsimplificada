@@ -114,6 +114,46 @@ idênticas às de lá:** os dois apps leem as mesmas linhas do banco, e uma
 divergência manda o conferente para a prateleira errada sem erro nenhum
 aparecer na tela. `test/enderecos_test.dart` trava esses casos.
 
-Falta um keystore fixo no CI — enquanto não houver, cada build muda a
-assinatura e atualizar o APK por cima dá "App não foi instalado" (é preciso
-desinstalar antes). Os secrets necessários estão anotados no `build.yml`.
+### Assinatura do APK (keystore fixo)
+
+O Android só aceita instalar uma atualização por cima se ela vier assinada com
+a **mesma chave** da versão instalada. Com a chave de debug do Flutter isso
+nunca acontece: ela muda a cada build, e o celular responde "App não foi
+instalado".
+
+O CI resolve isso lendo um keystore dos secrets do repositório
+(`tool/configurar_assinatura.py`). **Sem os quatro secrets configurados o build
+não quebra** — segue com a chave de debug e marca a release com um aviso.
+
+Para configurar, uma vez só:
+
+```bash
+# 1. Gere o keystore na SUA máquina (PKCS#12, padrão atual do keytool).
+#    Guarde este arquivo e as senhas: perdê-los significa nunca mais
+#    conseguir atualizar o app por cima — só desinstalando.
+keytool -genkeypair -v \
+  -keystore camda-contagem.p12 -storetype PKCS12 \
+  -keyalg RSA -keysize 2048 -validity 10000 \
+  -alias camda
+
+# 2. Converta para base64 numa linha só.
+base64 -w 0 camda-contagem.p12 > keystore.base64
+```
+
+Depois, em **Settings → Secrets and variables → Actions → New repository
+secret**, crie os quatro:
+
+| Secret | Valor |
+|---|---|
+| `KEYSTORE_BASE64` | conteúdo de `keystore.base64` |
+| `KEY_ALIAS` | `camda` (o `-alias` usado acima) |
+| `KEY_PASSWORD` | a senha da chave |
+| `STORE_PASSWORD` | a senha do keystore |
+
+O keystore é gerado localmente, e não pelo CI, de propósito: ele precisa de um
+backup que **você** controle. Se existisse só dentro dos secrets do GitHub,
+perder o acesso ao repositório significaria perder a capacidade de atualizar o
+app para sempre.
+
+Cada release passa a trazer o SHA-256 do certificado que assinou aquele APK —
+se ele for igual entre dois builds, a atualização por cima funciona.
