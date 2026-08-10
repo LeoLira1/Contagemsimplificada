@@ -67,7 +67,7 @@ class ItemCard extends StatelessWidget {
                       ),
                     ),
                     TextSpan(
-                      text: '  —  ${item.codigo}',
+                      text: '  —  ${item.codigos.map((c) => c.codigo).join(' + ')}',
                       style: const TextStyle(
                         color: CoresCamda.textoFraco,
                         fontSize: 13,
@@ -100,6 +100,17 @@ class ItemCard extends StatelessWidget {
                       ),
                       for (final e in extras) _ChipEndereco(endereco: e),
                     ],
+                  ),
+                ],
+
+                if (item.temVariosCodigos && !item.vinculadoNoMapa) ...[
+                  const SizedBox(height: 6),
+                  const _Aviso(
+                    icone: Icons.functions,
+                    texto: 'Códigos somados pelo nome do produto — não há '
+                        'vínculo cadastrado no mapa, então o total pode estar '
+                        'incompleto.',
+                    cor: CoresCamda.ambar,
                   ),
                 ],
 
@@ -138,7 +149,13 @@ class ItemCard extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
             child: Row(
               children: [
-                Expanded(child: _Quantidade(qtd: item.qtdEstoque)),
+                Expanded(
+                  child: _Quantidade(
+                    qtd: item.qtdEstoque,
+                    parcelas: item.temVariosCodigos ? item.codigos : null,
+                    incerto: item.temVariosCodigos && !item.vinculadoNoMapa,
+                  ),
+                ),
                 const SizedBox(width: 10),
                 _BotaoAcao(
                   rotulo: 'OK',
@@ -294,32 +311,65 @@ class _SemEndereco extends StatelessWidget {
   }
 }
 
+/// A quantidade que o conferente compara com a pilha.
+///
+/// Quando o produto tem mais de um código, o número grande é a SOMA e as
+/// parcelas aparecem embaixo — "11 + 73". Sem essa conta explícita, quem
+/// confere vê 11, conta 84 e registra uma divergência de 73 unidades que não
+/// existe.
 class _Quantidade extends StatelessWidget {
   final int qtd;
+  final List<CodigoDoGrupo>? parcelas;
 
-  const _Quantidade({required this.qtd});
+  /// True quando os códigos foram reunidos pelo nome, sem vínculo no
+  /// `mapa_produtos` — o total pode estar incompleto.
+  final bool incerto;
+
+  const _Quantidade({
+    required this.qtd,
+    this.parcelas,
+    this.incerto = false,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.baseline,
-      textBaseline: TextBaseline.alphabetic,
+    final p = parcelas;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
       children: [
-        Text(
-          '$qtd',
-          style: const TextStyle(
-            color: CoresCamda.texto,
-            fontSize: 26,
-            fontWeight: FontWeight.w800,
-            fontFamily: 'monospace',
-            height: 1,
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.baseline,
+          textBaseline: TextBaseline.alphabetic,
+          children: [
+            Text(
+              '$qtd',
+              style: const TextStyle(
+                color: CoresCamda.texto,
+                fontSize: 26,
+                fontWeight: FontWeight.w800,
+                fontFamily: 'monospace',
+                height: 1,
+              ),
+            ),
+            const SizedBox(width: 5),
+            const Text(
+              'un',
+              style: TextStyle(color: CoresCamda.textoApagado, fontSize: 13),
+            ),
+          ],
+        ),
+        if (p != null && p.length > 1) ...[
+          const SizedBox(height: 3),
+          Text(
+            p.map((c) => '${c.quantidade}').join(' + '),
+            style: TextStyle(
+              color: incerto ? CoresCamda.ambar : CoresCamda.textoApagado,
+              fontSize: 11.5,
+              fontFamily: 'monospace',
+            ),
           ),
-        ),
-        const SizedBox(width: 5),
-        const Text(
-          'un',
-          style: TextStyle(color: CoresCamda.textoApagado, fontSize: 13),
-        ),
+        ],
       ],
     );
   }

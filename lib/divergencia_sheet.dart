@@ -87,7 +87,7 @@ class _FolhaDivergenciaState extends State<_FolhaDivergencia> {
 
   Future<void> _carregarAbertas() async {
     final abertas =
-        await ContagemService().divergenciasAbertas(widget.item.codigo);
+        await ContagemService().divergenciasAbertas(widget.item);
     if (!mounted) return;
     setState(() {
       _abertas = abertas;
@@ -160,7 +160,7 @@ class _FolhaDivergenciaState extends State<_FolhaDivergencia> {
               ),
               const SizedBox(height: 2),
               Text(
-                '${item.codigo}   ·   sistema: ${item.qtdEstoque} un',
+                '${item.codigos.map((c) => c.codigo).join(" + ")}   ·   sistema: ${item.qtdEstoque} un',
                 style: const TextStyle(
                   color: CoresCamda.textoFraco,
                   fontSize: 13,

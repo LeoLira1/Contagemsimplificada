@@ -9,13 +9,19 @@ ItemContagem _item({
   List<EnderecoProduto> enderecos = const [],
   String motivo = '',
   String observacoes = '',
+  List<CodigoDoGrupo> codigos = const [
+    CodigoDoGrupo(codigo: '10432', quantidade: 24, naLista: true),
+  ],
+  bool vinculadoNoMapa = true,
 }) =>
     ItemContagem(
-      id: 1,
-      codigo: '10432',
+      ids: const [1],
+      codigoAncora: codigos.first.codigo,
+      codigos: codigos,
+      vinculadoNoMapa: vinculadoNoMapa,
       produto: 'GLIFOSATO 480 SL 20L',
       categoria: 'HERBICIDAS',
-      qtdEstoque: 24,
+      qtdEstoque: codigos.fold(0, (s, c) => s + c.quantidade),
       status: StatusContagem.pendente,
       motivo: motivo,
       observacoes: observacoes,
@@ -146,5 +152,39 @@ void main() {
     await tester.pump();
 
     expect(certas, 0);
+  });
+
+  testWidgets('PHOSFIX: mostra o total somado e as parcelas', (tester) async {
+    // 11 na lista + 73 do código irmão. Se o card mostrar 11, o conferente
+    // conta 84 na prateleira e registra uma falta de 73 que não existe.
+    await tester.pumpWidget(_envolver(ItemCard(
+      item: _item(
+        vinculadoNoMapa: false,
+        codigos: const [
+          CodigoDoGrupo(codigo: '222534', quantidade: 11, naLista: true),
+          CodigoDoGrupo(codigo: 'US222534', quantidade: 73, naLista: false),
+        ],
+      ),
+      onCerta: () {},
+      onDivergencia: () {},
+    )));
+
+    expect(find.text('84'), findsOneWidget);
+    expect(find.text('11 + 73'), findsOneWidget);
+    expect(find.textContaining('222534 + US222534'), findsOneWidget);
+    // Grupo montado por nome, sem vínculo no mapa: a tela tem de dizer que o
+    // total pode estar incompleto, em vez de apresentá-lo como certeza.
+    expect(find.textContaining('total pode estar incompleto'), findsOneWidget);
+  });
+
+  testWidgets('produto de código único não mostra soma', (tester) async {
+    await tester.pumpWidget(_envolver(ItemCard(
+      item: _item(),
+      onCerta: () {},
+      onDivergencia: () {},
+    )));
+
+    expect(find.text('24'), findsOneWidget);
+    expect(find.textContaining('total pode estar incompleto'), findsNothing);
   });
 }

@@ -39,6 +39,52 @@ cadastro de onde o produto mora, mesmo sem contagem. Um produto endereçado e
 nunca contado só aparece nas duas últimas — e é justamente quem mais precisa
 aparecer na tela.
 
+## Um produto, vários códigos
+
+Um produto da CAMDA pode ter mais de um código ativo — `222534` e `US222534`,
+`237191` e `100237191` — e **cada um tem sua própria linha de saldo em
+`estoque_mestre`**. Na prateleira existe uma pilha só.
+
+Sem somar, o card do PHOSFIX mostraria `11 un`, o conferente contaria as 84
+que estão na gôndola e registraria uma falta de 73 unidades que não existe.
+O erro seria silencioso e iria direto para o estoque.
+
+O card mostra a soma, com as parcelas embaixo:
+
+```
+ADJUVANTE PHOSFIX NORTOX 5L — 222534 + US222534
+84 un
+11 + 73
+```
+
+A resolução tem três degraus (`lib/agrupamento.dart`):
+
+1. **`mapa_produtos` / `mapa_produtos_codigos`** — o vínculo cadastrado no
+   dashboard (`db_mapa.py`). Autoritativo: `codigo` tem índice UNIQUE, então
+   um código pertence a um produto só.
+2. **Nome do produto** — quando o código não está no mapa. O app `scanner`
+   usa aqui a convenção `US` (`254185` ↔ `US254185`), que **não cobre** o
+   prefixo `100` do Ultimato. Agrupar por nome cobre qualquer prefixo sem
+   adivinhar aritmética de string, e `mapa_produtos.nome` é UNIQUE.
+3. **O próprio código** — produto sem nome legível fica sozinho.
+
+Quando o grupo vem do degrau 2, o card avisa que o total pode estar
+incompleto — mesma ressalva que o scanner mostra.
+
+Consequências no resto do app:
+
+- **Um card, não dois.** Se os dois códigos estiverem na lista de contagem,
+  eles viram um card só; dois fariam o conferente contar a mesma pilha duas
+  vezes. Confirmar resolve todas as linhas de `contagem_itens` do grupo.
+- **Endereço de qualquer código.** As posições são procuradas por todos os
+  códigos do grupo: quem está endereçado no app Gôndolas costuma ser o código
+  irmão, não o que veio na lista.
+- **Divergência tem um código âncora.** A diferença é do produto, mas
+  `estoque_mestre` e `divergencias` são por código, então é preciso escolher
+  um: o principal do mapa, senão o de maior saldo. Os irmãos ficam intactos,
+  e por isso a soma continua batendo — `âncora + diferença` mais os irmãos dá
+  exatamente a quantidade contada.
+
 ## O que o app grava
 
 **OK ✓** → `contagem_itens.status = 'certa'`; se o produto estava em falta ou
