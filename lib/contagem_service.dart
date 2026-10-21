@@ -1,7 +1,11 @@
 import 'package:libsql_dart/libsql_dart.dart';
 
+import 'agrupamento.dart';
 import 'enderecos.dart';
 import 'turso_service.dart';
+
+export 'agrupamento.dart'
+    show StatusContagem, CodigoDoGrupo, MapaProdutos, normalizarCodigo;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Conversores tolerantes
@@ -27,21 +31,6 @@ double _asDouble(Object? v) {
 
 String _asString(Object? v) => v == null ? '' : v.toString();
 
-/// Status de um item na lista de contagem — os mesmos três valores que o
-/// dashboard grava em `contagem_itens.status`.
-enum StatusContagem { pendente, certa, divergencia }
-
-StatusContagem _statusDe(String bruto) {
-  switch (bruto.trim().toLowerCase()) {
-    case 'certa':
-      return StatusContagem.certa;
-    case 'divergencia':
-      return StatusContagem.divergencia;
-    default:
-      return StatusContagem.pendente;
-  }
-}
-
 /// Uma divergência já aberta para o produto (tabela `divergencias`), mostrada
 /// antes de registrar uma nova. Sem isso o conferente registra a mesma falta
 /// duas vezes e o saldo do cooperado dobra.
@@ -63,34 +52,43 @@ class DivergenciaAberta {
   }
 }
 
-/// Um item da lista de contagem, já cruzado com as posições físicas.
+/// Um item da lista de contagem: um PRODUTO físico, com todos os seus códigos
+/// somados (ver `agrupamento.dart`) e cruzado com as posições da loja.
 class ItemContagem {
-  final int id;
-  final String codigo;
+  /// Linhas de `contagem_itens` que este card representa — uma por código do
+  /// produto que o dashboard pediu para conferir.
+  final List<int> ids;
+
+  /// Código que recebe o lançamento de divergência.
+  final String codigoAncora;
+
+  /// Todos os códigos do produto, com o saldo de cada um.
+  final List<CodigoDoGrupo> codigos;
+
+  /// False quando o parentesco entre os códigos foi deduzido pelo nome, sem
+  /// respaldo do `mapa_produtos` — o total pode estar incompleto.
+  final bool vinculadoNoMapa;
+
   final String produto;
   final String categoria;
 
-  /// Quantidade que o sistema diz existir — o número que o conferente
-  /// confirma ou contesta.
+  /// Soma dos saldos de TODOS os códigos do produto — o número que o
+  /// conferente compara com a pilha na prateleira.
   final int qtdEstoque;
 
   final StatusContagem status;
-
-  /// Texto que o dashboard usa para explicar por que o item entrou na lista
-  /// (entrada recente, saída sem venda). Vazio na maior parte dos itens.
   final String motivo;
-
-  /// Observação do produto no cadastro (ou o último cooperado com
-  /// divergência), vinda de `estoque_mestre`.
   final String observacoes;
 
-  /// Onde o produto está na loja, do app Gôndolas. Vazio quando o produto
-  /// nunca foi endereçado — o conferente vai ter de procurar.
+  /// Onde o produto está na loja, vindo do app Gôndolas. Reúne os endereços
+  /// de todos os códigos do grupo.
   final List<EnderecoProduto> enderecos;
 
   const ItemContagem({
-    required this.id,
-    required this.codigo,
+    required this.ids,
+    required this.codigoAncora,
+    required this.codigos,
+    required this.vinculadoNoMapa,
     required this.produto,
     required this.categoria,
     required this.qtdEstoque,
@@ -100,33 +98,38 @@ class ItemContagem {
     required this.enderecos,
   });
 
-  ItemContagem comEnderecos(List<EnderecoProduto> novos) => ItemContagem(
-        id: id,
-        codigo: codigo,
+  /// Identidade estável do card para as chaves de widget e o controle de
+  /// gravação em andamento.
+  int get id => ids.isEmpty ? codigoAncora.hashCode : ids.first;
+
+  bool get temVariosCodigos => codigos.length > 1;
+
+  ItemContagem _copiaCom({
+    List<EnderecoProduto>? enderecos,
+    StatusContagem? status,
+  }) =>
+      ItemContagem(
+        ids: ids,
+        codigoAncora: codigoAncora,
+        codigos: codigos,
+        vinculadoNoMapa: vinculadoNoMapa,
         produto: produto,
         categoria: categoria,
         qtdEstoque: qtdEstoque,
-        status: status,
+        status: status ?? this.status,
         motivo: motivo,
         observacoes: observacoes,
-        enderecos: novos,
+        enderecos: enderecos ?? this.enderecos,
       );
+
+  ItemContagem comEnderecos(List<EnderecoProduto> novos) =>
+      _copiaCom(enderecos: novos);
 
   /// Cópia com o novo status, aplicada na tela logo após a gravação dar
   /// certo. Evita recarregar a lista inteira do banco a cada item conferido —
   /// com rede de loja, esse recarregamento é a diferença entre conferir num
   /// ritmo e esperar a cada toque.
-  ItemContagem comStatus(StatusContagem novo) => ItemContagem(
-        id: id,
-        codigo: codigo,
-        produto: produto,
-        categoria: categoria,
-        qtdEstoque: qtdEstoque,
-        status: novo,
-        motivo: motivo,
-        observacoes: observacoes,
-        enderecos: enderecos,
-      );
+  ItemContagem comStatus(StatusContagem novo) => _copiaCom(status: novo);
 
   /// Endereços que ainda existem no chão da loja. Os de estante removida
   /// continuam na lista completa (`enderecos`) para o card poder avisar que o
@@ -152,6 +155,15 @@ class ResumoContagem {
   });
 
   bool get concluida => total > 0 && pendentes == 0;
+
+  factory ResumoContagem.de(List<ItemContagem> itens) => ResumoContagem(
+        total: itens.length,
+        certas: itens.where((i) => i.status == StatusContagem.certa).length,
+        divergencias:
+            itens.where((i) => i.status == StatusContagem.divergencia).length,
+        pendentes:
+            itens.where((i) => i.status == StatusContagem.pendente).length,
+      );
 }
 
 /// Lista de contagem carregada do banco, com o resumo já calculado.
@@ -192,46 +204,75 @@ class ContagemService {
   // Leitura
   // ───────────────────────────────────────────────────────────────────────────
 
-  /// Carrega a lista de contagem inteira (a mesma da aba Contagem do
-  /// dashboard) e cruza cada item com as posições do app Gôndolas.
+  /// Carrega a lista de contagem, agrupa os códigos do mesmo produto e cruza
+  /// cada item com as posições do app Gôndolas.
   Future<ListaContagem> carregar() async {
     final client = await _conexao();
     if (client == null) return ListaContagem.vazia;
 
-    final itens = await _carregarItens(client);
-    if (itens.isEmpty) {
-      return const ListaContagem(
-        itens: [],
-        resumo:
-            ResumoContagem(total: 0, certas: 0, divergencias: 0, pendentes: 0),
-      );
-    }
+    final linhas = await _carregarLinhas(client);
+    if (linhas.isEmpty) return ListaContagem.vazia;
+
+    // O mestre inteiro é preciso porque o código irmão pode NÃO estar na
+    // lista de contagem: no PHOSFIX só o `222534` foi pedido, e é o
+    // `US222534` que carrega 73 das 84 unidades da prateleira.
+    final mestre = await _carregarMestre(client);
+    final mapa = await _carregarMapa(client);
+
+    final agrupados =
+        agruparItens(linhas: linhas, mestre: mestre, mapa: mapa);
 
     final enderecos = await _carregarEnderecos(client);
-    final comEndereco = itens
-        .map((i) => i.comEnderecos(enderecos[_norm(i.codigo)] ?? const []))
-        .toList();
+    final itens = [
+      for (final g in agrupados)
+        ItemContagem(
+          ids: g.ids,
+          codigoAncora: g.codigoAncora,
+          codigos: g.codigos,
+          vinculadoNoMapa: g.vinculadoNoMapa,
+          produto: g.produto,
+          categoria: g.categoria,
+          qtdEstoque: g.qtdEstoque,
+          status: g.status,
+          motivo: g.motivo,
+          observacoes: g.observacoes,
+          // Endereço de QUALQUER código do produto: é uma pilha só na
+          // prateleira, e quem está endereçado no Gôndolas costuma ser o
+          // código irmão, não o que veio na lista.
+          enderecos: _enderecosDoGrupo(g.codigos, enderecos),
+        ),
+    ];
 
-    return ListaContagem(
-      itens: comEndereco,
-      resumo: ResumoContagem(
-        total: comEndereco.length,
-        certas: comEndereco
-            .where((i) => i.status == StatusContagem.certa)
-            .length,
-        divergencias: comEndereco
-            .where((i) => i.status == StatusContagem.divergencia)
-            .length,
-        pendentes: comEndereco
-            .where((i) => i.status == StatusContagem.pendente)
-            .length,
-      ),
-    );
+    return ListaContagem(itens: itens, resumo: ResumoContagem.de(itens));
   }
 
-  static String _norm(String codigo) => codigo.trim().toUpperCase();
+  static List<EnderecoProduto> _enderecosDoGrupo(
+    List<CodigoDoGrupo> codigos,
+    Map<String, List<EnderecoProduto>> porCodigo,
+  ) {
+    final vistos = <String>{};
+    final juntos = <EnderecoProduto>[];
+    for (final c in codigos) {
+      for (final e in porCodigo[c.codigo] ?? const <EnderecoProduto>[]) {
+        // Dedup pelo endereço físico, ignorando o código: dois códigos do
+        // mesmo produto endereçados na mesma prateleira são um lugar só.
+        final chave = '${e.localTipo}|${e.localNum}|'
+            '${e.faceOuColuna}|${e.andarOuNivel}';
+        if (vistos.add(chave)) juntos.add(e);
+      }
+    }
+    juntos.sort((a, b) {
+      if (a.ehGondola != b.ehGondola) return a.ehGondola ? -1 : 1;
+      if (a.localNum != b.localNum) return a.localNum.compareTo(b.localNum);
+      if (a.faceOuColuna != b.faceOuColuna) {
+        return a.faceOuColuna.compareTo(b.faceOuColuna);
+      }
+      return a.andarOuNivel.compareTo(b.andarOuNivel);
+    });
+    return juntos;
+  }
 
-  Future<List<ItemContagem>> _carregarItens(LibsqlClient client) async {
+  Future<List<LinhaContagem>> _carregarLinhas(LibsqlClient client) async {
     // Espelha o SELECT de get_contagem_itens() no dashboard, inclusive a CTE
     // que pega o cooperado da divergência mais recente — é ele que aparece na
     // observação do card quando o produto não tem observação no cadastro.
@@ -277,22 +318,83 @@ class ContagemService {
       rows = (await (await client.prepare(fallback)).query()) as List<dynamic>;
     }
 
-    final itens = <ItemContagem>[];
-    for (final dynamic row in rows) {
-      final r = row as Map<String, dynamic>;
-      itens.add(ItemContagem(
-        id: _asInt(r['id']),
-        codigo: _asString(r['codigo']).trim(),
-        produto: _asString(r['produto']).trim(),
-        categoria: _asString(r['categoria']).trim(),
-        qtdEstoque: _asInt(r['qtd_estoque']),
-        status: _statusDe(_asString(r['status'])),
-        motivo: _asString(r['motivo']).trim(),
-        observacoes: _asString(r['observacoes']).trim(),
-        enderecos: const [],
-      ));
+    return [
+      for (final dynamic row in rows)
+        if (row is Map<String, dynamic>)
+          LinhaContagem(
+            id: _asInt(row['id']),
+            codigo: _asString(row['codigo']).trim(),
+            produto: _asString(row['produto']).trim(),
+            categoria: _asString(row['categoria']).trim(),
+            qtdEstoque: _asInt(row['qtd_estoque']),
+            status: statusDe(_asString(row['status'])),
+            motivo: _asString(row['motivo']).trim(),
+            observacoes: _asString(row['observacoes']).trim(),
+          ),
+    ];
+  }
+
+  /// `estoque_mestre` reduzido a três colunas. É a tabela que revela os
+  /// códigos irmãos ausentes da lista de contagem.
+  Future<List<LinhaMestre>> _carregarMestre(LibsqlClient client) async {
+    try {
+      const sql = 'SELECT codigo, produto, qtd_sistema FROM estoque_mestre';
+      final rows = (await (await client.prepare(sql)).query()) as List<dynamic>;
+      return [
+        for (final dynamic row in rows)
+          if (row is Map<String, dynamic>)
+            LinhaMestre(
+              codigo: _asString(row['codigo']).trim(),
+              produto: _asString(row['produto']).trim(),
+              qtdSistema: _asInt(row['qtd_sistema']),
+            ),
+      ];
+    } catch (_) {
+      // Sem o mestre a contagem ainda funciona, código a código, sem soma.
+      return const [];
     }
-    return itens;
+  }
+
+  /// Vínculo explícito entre códigos (`mapa_produtos` +
+  /// `mapa_produtos_codigos`), criado pelo dashboard em `db_mapa.py`. Pode
+  /// não existir — nesse caso o agrupamento cai para o nome do produto.
+  Future<MapaProdutos> _carregarMapa(LibsqlClient client) async {
+    final produtoPorCodigo = <String, String>{};
+    final principalPorProduto = <String, String>{};
+    try {
+      const sqlPrincipal =
+          'SELECT produto_id, codigo FROM mapa_produtos WHERE codigo IS NOT NULL';
+      final principais =
+          (await (await client.prepare(sqlPrincipal)).query()) as List<dynamic>;
+      for (final dynamic row in principais) {
+        if (row is! Map<String, dynamic>) continue;
+        final id = _asString(row['produto_id']).trim();
+        final cod = normalizarCodigo(_asString(row['codigo']));
+        if (id.isEmpty || cod.isEmpty) continue;
+        principalPorProduto[id] = cod;
+        produtoPorCodigo[cod] = id;
+      }
+
+      const sqlSecundarios =
+          'SELECT produto_id, codigo FROM mapa_produtos_codigos';
+      final secundarios = (await (await client.prepare(sqlSecundarios)).query())
+          as List<dynamic>;
+      for (final dynamic row in secundarios) {
+        if (row is! Map<String, dynamic>) continue;
+        final id = _asString(row['produto_id']).trim();
+        final cod = normalizarCodigo(_asString(row['codigo']));
+        if (id.isEmpty || cod.isEmpty) continue;
+        produtoPorCodigo[cod] = id;
+      }
+    } catch (_) {
+      // Banco sem as tabelas do mapa: o agrupamento por nome dá conta dos
+      // casos conhecidos (prefixos US e 100).
+      return MapaProdutos.vazio;
+    }
+    return MapaProdutos(
+      produtoPorCodigo: produtoPorCodigo,
+      principalPorProduto: principalPorProduto,
+    );
   }
 
   /// Posições de todos os produtos da lista de contagem, indexadas pelo
@@ -304,9 +406,7 @@ class ContagemService {
   ///   mesmo que ninguém tenha contado a posição ainda.
   ///
   /// Um produto endereçado mas nunca contado só aparece nas duas últimas — e é
-  /// justamente quem mais precisa aparecer na tela do conferente. As três
-  /// consultas filtram pela própria `contagem_itens` (JOIN em vez de `IN`),
-  /// então o tamanho da lista não esbarra no limite de variáveis do SQLite.
+  /// justamente quem mais precisa aparecer na tela do conferente.
   Future<Map<String, List<EnderecoProduto>>> _carregarEnderecos(
       LibsqlClient client) async {
     final porCodigo = <String, List<EnderecoProduto>>{};
@@ -314,32 +414,37 @@ class ContagemService {
 
     void adicionar(EnderecoProduto e) {
       if (!vistos.add(e.chave)) return;
-      porCodigo.putIfAbsent(_norm(e.produtoCodigo), () => []).add(e);
+      porCodigo
+          .putIfAbsent(normalizarCodigo(e.produtoCodigo), () => [])
+          .add(e);
     }
 
     // 1. estoque_localizado — endereço COM quantidade. Vem primeiro para que
     //    a deduplicação preserve a quantidade quando o mesmo endereço também
     //    estiver no layout.
+    //
+    // As três consultas varrem a tabela inteira em vez de filtrar pela
+    // contagem: agora que os endereços são procurados por TODOS os códigos do
+    // grupo — inclusive os que não estão em `contagem_itens` —, um JOIN com
+    // ela deixaria de fora justamente o irmão endereçado.
     try {
       const sql = '''
-        SELECT el.produto_codigo, el.local_tipo, el.local_num,
-               el.face_ou_coluna, el.andar_ou_nivel, el.quantidade
-        FROM estoque_localizado el
-        JOIN contagem_itens ci
-          ON UPPER(TRIM(ci.codigo)) = UPPER(TRIM(el.produto_codigo))
+        SELECT produto_codigo, local_tipo, local_num,
+               face_ou_coluna, andar_ou_nivel, quantidade
+        FROM estoque_localizado
       ''';
       final rows = (await (await client.prepare(sql)).query()) as List<dynamic>;
       for (final dynamic row in rows) {
-        final r = row as Map<String, dynamic>;
+        if (row is! Map<String, dynamic>) continue;
         adicionar(EnderecoProduto(
-          produtoCodigo: _asString(r['produto_codigo']).trim(),
-          localTipo: _asString(r['local_tipo']).trim() == 'gondola'
+          produtoCodigo: _asString(row['produto_codigo']).trim(),
+          localTipo: _asString(row['local_tipo']).trim() == 'gondola'
               ? 'gondola'
               : 'estante',
-          localNum: _asInt(r['local_num']),
-          faceOuColuna: _asInt(r['face_ou_coluna']),
-          andarOuNivel: _asInt(r['andar_ou_nivel']),
-          quantidade: _asDouble(r['quantidade']),
+          localNum: _asInt(row['local_num']),
+          faceOuColuna: _asInt(row['face_ou_coluna']),
+          andarOuNivel: _asInt(row['andar_ou_nivel']),
+          quantidade: _asDouble(row['quantidade']),
         ));
       }
     } catch (_) {
@@ -353,20 +458,18 @@ class ContagemService {
     //    não ajuda ninguém.
     try {
       const sql = '''
-        SELECT DISTINCT el.produto_codigo, el.estante_num, el.coluna, el.nivel
-        FROM estante_layout el
-        JOIN contagem_itens ci
-          ON UPPER(TRIM(ci.codigo)) = UPPER(TRIM(el.produto_codigo))
+        SELECT DISTINCT produto_codigo, estante_num, coluna, nivel
+        FROM estante_layout
       ''';
       final rows = (await (await client.prepare(sql)).query()) as List<dynamic>;
       for (final dynamic row in rows) {
-        final r = row as Map<String, dynamic>;
+        if (row is! Map<String, dynamic>) continue;
         adicionar(EnderecoProduto(
-          produtoCodigo: _asString(r['produto_codigo']).trim(),
+          produtoCodigo: _asString(row['produto_codigo']).trim(),
           localTipo: 'estante',
-          localNum: _asInt(r['estante_num']),
-          faceOuColuna: _asInt(r['coluna']),
-          andarOuNivel: _asInt(r['nivel']),
+          localNum: _asInt(row['estante_num']),
+          faceOuColuna: _asInt(row['coluna']),
+          andarOuNivel: _asInt(row['nivel']),
         ));
       }
     } catch (_) {
@@ -377,75 +480,68 @@ class ContagemService {
     //    (mesma regra do app Gôndolas, ver faceFromPos).
     try {
       const sql = '''
-        SELECT gl.produto_codigo, gl.gondola_num, gl.andar, gl.pos_x, gl.pos_z
-        FROM gondola_layout gl
-        JOIN contagem_itens ci
-          ON UPPER(TRIM(ci.codigo)) = UPPER(TRIM(gl.produto_codigo))
+        SELECT produto_codigo, gondola_num, andar, pos_x, pos_z
+        FROM gondola_layout
       ''';
       final rows = (await (await client.prepare(sql)).query()) as List<dynamic>;
       for (final dynamic row in rows) {
-        final r = row as Map<String, dynamic>;
+        if (row is! Map<String, dynamic>) continue;
         adicionar(EnderecoProduto(
-          produtoCodigo: _asString(r['produto_codigo']).trim(),
+          produtoCodigo: _asString(row['produto_codigo']).trim(),
           localTipo: 'gondola',
-          localNum: _asInt(r['gondola_num']),
-          faceOuColuna: faceFromPos(_asDouble(r['pos_x']), _asDouble(r['pos_z'])),
-          andarOuNivel: _asInt(r['andar']),
+          localNum: _asInt(row['gondola_num']),
+          faceOuColuna:
+              faceFromPos(_asDouble(row['pos_x']), _asDouble(row['pos_z'])),
+          andarOuNivel: _asInt(row['andar']),
         ));
       }
     } catch (_) {
       // idem
     }
 
-    // Ordena cada lista para o card mostrar sempre na mesma ordem: gôndolas
-    // primeiro (é por onde se anda na loja), depois estantes por número.
-    for (final lista in porCodigo.values) {
-      lista.sort((a, b) {
-        if (a.ehGondola != b.ehGondola) return a.ehGondola ? -1 : 1;
-        if (a.localNum != b.localNum) return a.localNum.compareTo(b.localNum);
-        if (a.faceOuColuna != b.faceOuColuna) {
-          return a.faceOuColuna.compareTo(b.faceOuColuna);
-        }
-        return a.andarOuNivel.compareTo(b.andarOuNivel);
-      });
-    }
     return porCodigo;
   }
 
-  /// Divergências ainda abertas para um produto. O dashboard mostra isso
-  /// antes de registrar outra, para o conferente escolher entre confirmar a
-  /// que já existe ou somar uma nova.
-  Future<List<DivergenciaAberta>> divergenciasAbertas(String codigo) async {
+  /// Divergências ainda abertas para o produto — em qualquer um dos seus
+  /// códigos. O dashboard mostra isso antes de registrar outra, para o
+  /// conferente escolher entre confirmar a que já existe ou somar uma nova.
+  Future<List<DivergenciaAberta>> divergenciasAbertas(
+      ItemContagem item) async {
     final client = await _conexao();
     if (client == null) return const [];
-    try {
-      final stmt = await client.prepare(
-        'SELECT cooperado, delta, status FROM divergencias '
-        'WHERE UPPER(TRIM(codigo)) = UPPER(TRIM(?))',
-      );
-      final rows = (await stmt.query(positional: [codigo])) as List<dynamic>;
-      return rows.map((dynamic row) {
-        final r = row as Map<String, dynamic>;
-        return DivergenciaAberta(
-          cooperado: _asString(r['cooperado']),
-          delta: _asInt(r['delta']),
-          status: _asString(r['status']),
+    final abertas = <DivergenciaAberta>[];
+    for (final c in item.codigos) {
+      try {
+        final stmt = await client.prepare(
+          'SELECT cooperado, delta, status FROM divergencias '
+          'WHERE UPPER(TRIM(codigo)) = UPPER(TRIM(?))',
         );
-      }).toList();
-    } catch (_) {
-      return const [];
+        final rows = (await stmt.query(positional: [c.codigo])) as List<dynamic>;
+        for (final dynamic row in rows) {
+          if (row is! Map<String, dynamic>) continue;
+          abertas.add(DivergenciaAberta(
+            cooperado: _asString(row['cooperado']),
+            delta: _asInt(row['delta']),
+            status: _asString(row['status']),
+          ));
+        }
+      } catch (_) {
+        // Um código que falha não pode esconder as divergências dos outros.
+      }
     }
+    return abertas;
   }
 
   // ───────────────────────────────────────────────────────────────────────────
   // Escrita
   // ───────────────────────────────────────────────────────────────────────────
 
-  /// Marca o item como conferido e certo — o botão "OK ✓".
+  /// Marca o produto como conferido e certo — o botão "OK ✓".
   ///
-  /// Espelha `atualizar_item_contagem(status='certa')` do dashboard: o
-  /// produto volta a 'ok' no estoque mestre (só se estava em falta/sobra) e
-  /// sai da lista de divergências do cooperado.
+  /// Resolve TODAS as linhas de `contagem_itens` do produto e limpa a
+  /// situação de TODOS os seus códigos: a pilha foi conferida por inteiro, e
+  /// deixar o código irmão pendente pediria uma segunda contagem da mesma
+  /// prateleira.
   Future<bool> confirmarCerta(ItemContagem item) async {
     final client = await _conexao();
     if (client == null) return false;
@@ -455,44 +551,25 @@ class ContagemService {
       // Estoque mestre ANTES de contagem_itens: os triggers
       // trig_contagem_to_cicli / trig_contagem_status_ciclo disparam na
       // mudança de status de contagem_itens e leem qtd_fisica do mestre. Com
-      // esta ordem eles já enxergam o valor final e o inventário cíclico sai
-      // certo sem precisar de correção posterior.
-      final stmtMestre = await client.prepare(
-        "UPDATE estoque_mestre SET status = 'ok', qtd_fisica = qtd_sistema, "
-        "diferenca = 0, nota = '', ultima_contagem = ? "
-        "WHERE codigo = ? AND status IN ('falta', 'sobra')",
-      );
-      await stmtMestre.query(positional: [agora, item.codigo]);
+      // esta ordem eles já enxergam o valor final.
+      for (final c in item.codigos) {
+        final stmtMestre = await client.prepare(
+          "UPDATE estoque_mestre SET status = 'ok', qtd_fisica = qtd_sistema, "
+          "diferenca = 0, nota = '', ultima_contagem = ? "
+          "WHERE codigo = ? AND status IN ('falta', 'sobra')",
+        );
+        await stmtMestre.query(positional: [agora, c.codigo]);
 
-      final stmtDel = await client.prepare(
-        'DELETE FROM divergencias WHERE codigo = ?',
-      );
-      await stmtDel.query(positional: [item.codigo]);
+        final stmtDel = await client.prepare(
+          'DELETE FROM divergencias WHERE codigo = ?',
+        );
+        await stmtDel.query(positional: [c.codigo]);
+      }
 
-      final stmtItem = await client.prepare(
-        "UPDATE contagem_itens SET status = 'certa', motivo = '', "
-        'qtd_divergencia = 0, confirmado_em = ? WHERE id = ?',
-      );
-      await stmtItem.query(positional: [agora, item.id]);
+      for (final id in item.ids) {
+        await _marcarItem(client, id, 'certa', '', 0, agora);
+      }
 
-      TursoService().dataRevision.value++;
-      return true;
-    } catch (_) {
-      return await _confirmarCertaSemConfirmadoEm(client, item, agora);
-    }
-  }
-
-  /// Base antiga, sem a coluna `confirmado_em` de `contagem_itens`. O trigger
-  /// `trig_contagem_confirmado_em` só existe onde a coluna existe, então aqui
-  /// basta gravar o status.
-  Future<bool> _confirmarCertaSemConfirmadoEm(
-      LibsqlClient client, ItemContagem item, String agora) async {
-    try {
-      final stmt = await client.prepare(
-        "UPDATE contagem_itens SET status = 'certa', motivo = '', "
-        'qtd_divergencia = 0 WHERE id = ?',
-      );
-      await stmt.query(positional: [item.id]);
       TursoService().dataRevision.value++;
       return true;
     } catch (_) {
@@ -502,10 +579,15 @@ class ContagemService {
 
   /// Registra uma divergência — o botão "DIVERGÊNCIA".
   ///
-  /// [qtdDivergindo] é sempre positiva; [sobra] diz o sentido. [confirmarApenas]
-  /// repete o comportamento do dashboard: quando já existe divergência aberta
-  /// para o produto, o conferente pode confirmá-la sem criar um registro novo
-  /// (senão o saldo do cooperado dobraria).
+  /// [qtdDivergindo] é sempre positiva; [sobra] diz o sentido, e os dois se
+  /// referem ao TOTAL do produto (soma de todos os códigos).
+  ///
+  /// A diferença é lançada num código só, o [ItemContagem.codigoAncora]: a
+  /// pilha na prateleira não distingue código, mas `estoque_mestre` e
+  /// `divergencias` são por código e é preciso escolher um. Os irmãos ficam
+  /// com o saldo intacto, então a soma do produto continua batendo com o que
+  /// foi contado — `ancora + delta` mais os irmãos inalterados dá exatamente
+  /// a quantidade contada.
   Future<bool> registrarDivergencia({
     required ItemContagem item,
     required int qtdDivergindo,
@@ -518,11 +600,22 @@ class ContagemService {
 
     final agora = _agoraBrt();
     final qtd = qtdDivergindo.abs();
-    final qtdSistema = item.qtdEstoque;
-    final qtdFisica = sobra ? qtdSistema + qtd : (qtdSistema - qtd).clamp(0, 1 << 31);
-    final diferenca = qtdFisica - qtdSistema;
+    final delta = sobra ? qtd : -qtd;
     final statusEstoque = sobra ? 'sobra' : 'falta';
     final motivoLimpo = motivo.trim();
+
+    // Saldo do próprio código âncora — a diferença do produto é aplicada
+    // sobre ele, não sobre o total.
+    final ancora = item.codigos.firstWhere(
+      (c) => c.codigo == item.codigoAncora,
+      orElse: () => CodigoDoGrupo(
+        codigo: item.codigoAncora,
+        quantidade: item.qtdEstoque,
+        naLista: true,
+      ),
+    );
+    final qtdFisicaAncora = (ancora.quantidade + delta).clamp(0, 1 << 31);
+    final diferencaAncora = qtdFisicaAncora - ancora.quantidade;
 
     try {
       // 1. Estoque mestre primeiro — ver comentário em confirmarCerta.
@@ -534,12 +627,12 @@ class ContagemService {
         );
         await stmt.query(positional: [
           statusEstoque,
-          qtdFisica,
-          diferenca,
+          qtdFisicaAncora,
+          diferencaAncora,
           motivoLimpo,
           motivoLimpo,
           agora,
-          item.codigo,
+          ancora.codigo,
         ]);
       } catch (_) {
         final stmt = await client.prepare(
@@ -548,25 +641,24 @@ class ContagemService {
         );
         await stmt.query(positional: [
           statusEstoque,
-          qtdFisica,
-          diferenca,
+          qtdFisicaAncora,
+          diferencaAncora,
           motivoLimpo,
           agora,
-          item.codigo,
+          ancora.codigo,
         ]);
       }
 
       // 2. Registro da divergência para a aba Divergências do dashboard.
       //    Pulado quando o conferente só está confirmando uma já existente.
       if (!confirmarApenas) {
-        final delta = sobra ? qtd : -qtd;
         final stmtDiv = await client.prepare(
           'INSERT INTO divergencias '
           '(codigo, produto, categoria, delta, status, cooperado, criado_em) '
           'VALUES (?, ?, ?, ?, ?, ?, ?)',
         );
         await stmtDiv.query(positional: [
-          item.codigo,
+          ancora.codigo,
           item.produto,
           item.categoria,
           delta,
@@ -581,7 +673,7 @@ class ContagemService {
           'VALUES (?, ?, ?, ?, ?, ?, ?)',
         );
         await stmtHist.query(positional: [
-          item.codigo,
+          ancora.codigo,
           item.produto,
           item.categoria,
           motivoLimpo,
@@ -591,25 +683,42 @@ class ContagemService {
         ]);
       }
 
-      // 3. Item da contagem por último — dispara os triggers do cíclico.
-      try {
-        final stmt = await client.prepare(
-          "UPDATE contagem_itens SET status = 'divergencia', motivo = ?, "
-          'qtd_divergencia = ?, confirmado_em = ? WHERE id = ?',
-        );
-        await stmt.query(positional: [motivoLimpo, qtd, agora, item.id]);
-      } catch (_) {
-        final stmt = await client.prepare(
-          "UPDATE contagem_itens SET status = 'divergencia', motivo = ?, "
-          'qtd_divergencia = ? WHERE id = ?',
-        );
-        await stmt.query(positional: [motivoLimpo, qtd, item.id]);
+      // 3. Itens da contagem por último — disparam os triggers do cíclico.
+      for (final id in item.ids) {
+        await _marcarItem(client, id, 'divergencia', motivoLimpo, qtd, agora);
       }
 
       TursoService().dataRevision.value++;
       return true;
     } catch (_) {
       return false;
+    }
+  }
+
+  /// Grava o status de uma linha de `contagem_itens`.
+  ///
+  /// `confirmado_em` é coluna de migração do dashboard: onde ela não existe,
+  /// regrava sem ela em vez de derrubar a confirmação inteira.
+  Future<void> _marcarItem(
+    LibsqlClient client,
+    int id,
+    String status,
+    String motivo,
+    int qtdDivergencia,
+    String agora,
+  ) async {
+    try {
+      final stmt = await client.prepare(
+        'UPDATE contagem_itens SET status = ?, motivo = ?, '
+        'qtd_divergencia = ?, confirmado_em = ? WHERE id = ?',
+      );
+      await stmt.query(positional: [status, motivo, qtdDivergencia, agora, id]);
+    } catch (_) {
+      final stmt = await client.prepare(
+        'UPDATE contagem_itens SET status = ?, motivo = ?, '
+        'qtd_divergencia = ? WHERE id = ?',
+      );
+      await stmt.query(positional: [status, motivo, qtdDivergencia, id]);
     }
   }
 }

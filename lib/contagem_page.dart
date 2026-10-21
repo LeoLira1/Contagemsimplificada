@@ -29,7 +29,8 @@ class ContagemPage extends StatefulWidget {
   State<ContagemPage> createState() => _ContagemPageState();
 }
 
-class _ContagemPageState extends State<ContagemPage> {
+class _ContagemPageState extends State<ContagemPage>
+    with WidgetsBindingObserver {
   ListaContagem _lista = ListaContagem.vazia;
   bool _carregando = true;
   String? _erro;
@@ -46,13 +47,28 @@ class _ContagemPageState extends State<ContagemPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _carregar();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _buscaCtrl.dispose();
     super.dispose();
+  }
+
+  /// O Android devolve o app minimizado com a lista de quando ele foi aberto.
+  /// Se o dashboard subiu planilha nesse meio-tempo, o conferente contaria
+  /// em cima de saldo velho — então recarrega ao voltar para a frente. Não
+  /// recarrega no meio de uma gravação, para não trocar o card embaixo dela.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed &&
+        !_carregando &&
+        _gravando.isEmpty) {
+      _carregar();
+    }
   }
 
   Future<void> _carregar() async {
@@ -184,7 +200,7 @@ class _ContagemPageState extends State<ContagemPage> {
       // Busca também pelo endereço: "e5" acha tudo que está na estante 5, que
       // é como o conferente pensa quando está parado na frente dela.
       return i.produto.toLowerCase().contains(termo) ||
-          i.codigo.toLowerCase().contains(termo) ||
+          i.codigos.any((c) => c.codigo.toLowerCase().contains(termo)) ||
           i.categoria.toLowerCase().contains(termo) ||
           i.enderecosValidos.any((e) =>
               e.compacto.toLowerCase().contains(termo) ||
@@ -679,7 +695,7 @@ class _CardConferido extends StatelessWidget {
                   ),
                 ),
                 Text(
-                  '${item.codigo}  ·  ${item.qtdEstoque} un'
+                  '${item.codigos.map((c) => c.codigo).join(" + ")}  ·  ${item.qtdEstoque} un'
                   '${item.enderecosValidos.isEmpty ? "" : "  ·  ${item.enderecosValidos.first.compacto}"}',
                   style: const TextStyle(
                     color: CoresCamda.textoApagado,
