@@ -29,7 +29,8 @@ lugar quando há dois faria a contagem sair errada por omissão.
 
 | Na tela | Tabela | Quem alimenta |
 |---|---|---|
-| Nome, código, categoria, quantidade | `contagem_itens` | dashboard, ao subir planilha parcial |
+| Nome, código, categoria | `contagem_itens` | dashboard, ao subir planilha parcial |
+| Quantidade (saldo atual) | `estoque_mestre.qtd_sistema` | dashboard, a cada upload — o mesmo número do scanner |
 | Observação / cooperado | `estoque_mestre`, `divergencias` | dashboard |
 | Estante ou gôndola + posição | `estoque_localizado`, `estante_layout`, `gondola_layout` | app Gôndolas |
 

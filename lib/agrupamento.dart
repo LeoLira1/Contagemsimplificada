@@ -208,10 +208,15 @@ class ItemAgrupado {
 /// caso do PHOSFIX, em que só `222534` foi pedido e `US222534` carrega 73 das
 /// 84 unidades); [mapa] é o vínculo explícito, quando o banco o tiver.
 ///
-/// Para um código que está na lista, o saldo usado é o `qtd_estoque` da
-/// própria linha de contagem — é o número que o dashboard pediu para
-/// conferir. Para os irmãos que não estão na lista, usa-se o `qtd_sistema` do
-/// `estoque_mestre`, que é o melhor dado disponível sobre eles.
+/// O saldo de cada código é o `qtd_sistema` ATUAL do `estoque_mestre` — o
+/// mesmo número que o scanner mostra. O `qtd_estoque` de `contagem_itens` é
+/// só uma foto de quando o item entrou na lista: uploads posteriores (Parcial
+/// Estoque, vendas de outro horário, entradas detectadas depois) atualizam o
+/// mestre mas nem sempre a foto, e o card mostraria um saldo que já mudou —
+/// o conferente lançaria uma falta ou sobra que não existe. O trigger
+/// `trig_contagem_to_cicli` do dashboard já compara com o mestre pelo mesmo
+/// motivo. A foto só é usada quando o código não tem linha no mestre
+/// (produto novo, ou zerado e removido).
 List<ItemAgrupado> agruparItens({
   required List<LinhaContagem> linhas,
   required List<LinhaMestre> mestre,
@@ -256,7 +261,8 @@ List<ItemAgrupado> agruparItens({
     for (final entrada in naLista.entries) {
       codigos.add(CodigoDoGrupo(
         codigo: entrada.key,
-        quantidade: entrada.value.qtdEstoque,
+        quantidade: mestrePorCodigo[entrada.key]?.qtdSistema ??
+            entrada.value.qtdEstoque,
         naLista: true,
       ));
     }
