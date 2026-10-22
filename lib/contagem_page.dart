@@ -29,7 +29,8 @@ class ContagemPage extends StatefulWidget {
   State<ContagemPage> createState() => _ContagemPageState();
 }
 
-class _ContagemPageState extends State<ContagemPage> {
+class _ContagemPageState extends State<ContagemPage>
+    with WidgetsBindingObserver {
   ListaContagem _lista = ListaContagem.vazia;
   bool _carregando = true;
   String? _erro;
@@ -41,18 +42,41 @@ class _ContagemPageState extends State<ContagemPage> {
   /// Ids com gravação em andamento — trava os botões daquele card.
   final Set<int> _gravando = {};
 
+  /// Status gravados por este aparelho, com o número da escrita que os
+  /// gravou. Um recarregamento que começou antes da escrita terminar traz do
+  /// banco a foto velha (item ainda pendente) e, ao chegar, devolveria à
+  /// lista um item que o conferente acabou de marcar. Com isto, o resultado
+  /// dele é corrigido pelas escritas que terminaram durante a consulta.
+  final Map<int, (StatusContagem, int)> _escritasLocais = {};
+  int _ultimaEscrita = 0;
+
   final _buscaCtrl = TextEditingController();
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _carregar();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _buscaCtrl.dispose();
     super.dispose();
+  }
+
+  /// O Android devolve o app minimizado com a lista de quando ele foi aberto.
+  /// Se o dashboard subiu planilha nesse meio-tempo, o conferente contaria
+  /// em cima de saldo velho — então recarrega ao voltar para a frente. Não
+  /// recarrega no meio de uma gravação, para não trocar o card embaixo dela.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed &&
+        !_carregando &&
+        _gravando.isEmpty) {
+      _carregar();
+    }
   }
 
   Future<void> _carregar() async {
@@ -72,11 +96,12 @@ class _ContagemPageState extends State<ContagemPage> {
       return;
     }
 
+    final escritaNoInicio = _ultimaEscrita;
     try {
       final lista = await ContagemService().carregar();
       if (!mounted) return;
       setState(() {
-        _lista = lista;
+        _lista = _comEscritasDuranteCarga(lista, escritaNoInicio);
         _carregando = false;
       });
     } catch (e) {
@@ -88,12 +113,23 @@ class _ContagemPageState extends State<ContagemPage> {
     }
   }
 
-  void _aplicarStatus(ItemContagem item, StatusContagem novo) {
-    setState(() {
-      final itens = _lista.itens
-          .map((i) => i.id == item.id ? i.comStatus(novo) : i)
-          .toList();
-      _lista = ListaContagem(
+  /// Reaplica sobre [lista] os status gravados depois de [escritaNoInicio]
+  /// — a consulta pode ter lido o banco antes deles.
+  ListaContagem _comEscritasDuranteCarga(
+      ListaContagem lista, int escritaNoInicio) {
+    final recentes = {
+      for (final MapEntry(key: id, value: (status, escrita))
+          in _escritasLocais.entries)
+        if (escrita > escritaNoInicio) id: status,
+    };
+    if (recentes.isEmpty) return lista;
+    return _listaCom([
+      for (final i in lista.itens)
+        if (recentes[i.id] case final status?) i.comStatus(status) else i,
+    ]);
+  }
+
+  static ListaContagem _listaCom(List<ItemContagem> itens) => ListaContagem(
         itens: itens,
         resumo: ResumoContagem(
           total: itens.length,
@@ -105,6 +141,13 @@ class _ContagemPageState extends State<ContagemPage> {
               itens.where((i) => i.status == StatusContagem.pendente).length,
         ),
       );
+
+  void _aplicarStatus(ItemContagem item, StatusContagem novo) {
+    _escritasLocais[item.id] = (novo, ++_ultimaEscrita);
+    setState(() {
+      _lista = _listaCom(_lista.itens
+          .map((i) => i.id == item.id ? i.comStatus(novo) : i)
+          .toList());
     });
   }
 

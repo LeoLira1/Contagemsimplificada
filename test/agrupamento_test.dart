@@ -179,6 +179,33 @@ void main() {
     });
   });
 
+  group('saldo atual do estoque_mestre', () {
+    test('a foto velha da lista de contagem não manda no saldo', () {
+      // Entrou na lista com 40; depois o upload de vendas baixou o mestre
+      // para 32. O card tem de mostrar 32, como o scanner.
+      final itens = agruparItens(
+        linhas: [_linha(1, '237191', 40, produto: 'ULTIMATO')],
+        mestre: [_mestre('237191', 32, produto: 'ULTIMATO')],
+      );
+      expect(itens.single.qtdEstoque, 32);
+      expect(itens.single.codigos.single.quantidade, 32);
+    });
+
+    test('vale também para os dois códigos na lista', () {
+      final itens = agruparItens(
+        linhas: [
+          _linha(1, '222534', 11, produto: 'PHOSFIX'),
+          _linha(2, 'US222534', 73, produto: 'PHOSFIX'),
+        ],
+        mestre: [
+          _mestre('222534', 9, produto: 'PHOSFIX'),
+          _mestre('US222534', 70, produto: 'PHOSFIX'),
+        ],
+      );
+      expect(itens.single.qtdEstoque, 79);
+    });
+  });
+
   group('casos de borda', () {
     test('produto sem irmão continua com o próprio saldo', () {
       final itens = agruparItens(
