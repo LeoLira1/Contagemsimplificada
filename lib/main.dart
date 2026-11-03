@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import 'config_page.dart';
 import 'contagem_page.dart';
+import 'fila_gravacao.dart';
 import 'tema.dart';
 import 'turso_service.dart';
 
@@ -50,6 +51,9 @@ class _AberturaState extends State<Abertura> {
       // conexão antes de consultar, e adiantar o handshake aqui tira esse
       // tempo do caminho da primeira consulta.
       unawaited(TursoService().init());
+      // Conferências que ficaram no aparelho (rede caiu, app fechado) voltam
+      // a subir sozinhas logo na abertura.
+      unawaited(FilaGravacao().carregar());
     }
     if (!mounted) return;
     setState(() => _configurado = tem);
