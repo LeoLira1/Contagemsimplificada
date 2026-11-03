@@ -4,21 +4,20 @@ import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:libsql_dart/libsql_dart.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'gravacao_lote.dart';
+
 /// Conexão com o mesmo banco Turso usado pelo dashboard `camda-estoque` e
 /// pelo app `Gondolas`.
 ///
-/// Diferente do Gôndolas, aqui a conexão é SEMPRE remota (sem réplica local
-/// com escrita offline). São dois motivos, os dois específicos da contagem:
+/// LEITURA é sempre remota (sem réplica local): a lista de contagem é montada
+/// pelo dashboard a cada upload de planilha, e conferir uma lista velha,
+/// cacheada do dia anterior, é pior do que não conferir.
 ///
-/// 1. A lista de contagem é montada pelo dashboard a cada upload de planilha.
-///    Conferir uma lista velha, cacheada do dia anterior, é pior do que não
-///    conferir — o conferente contaria produtos que já saíram da lista.
-/// 2. Confirmar um item dispara triggers no banco (`trig_contagem_to_cicli`,
-///    `trig_contagem_status_ciclo`) que alimentam o inventário cíclico. Uma
-///    escrita offline que só sobe depois abriria janela para conflito com o
-///    mesmo item confirmado pelo dashboard.
-///
-/// Na prática: o app exige rede para trabalhar, e é honesto quanto a isso.
+/// ESCRITA vai pela fila (fila_gravacao.dart), como no Gôndolas: a
+/// conferência é guardada no aparelho na hora do toque e sobe num lote único
+/// e idempotente ([executarLote]) assim que a rede deixar. O risco de
+/// conflito com o dashboard (lista trocada, item já conferido) é barrado no
+/// próprio lote, que então é descartado com aviso em vez de gravar errado.
 class TursoService {
   static final TursoService _instance = TursoService._internal();
   factory TursoService() => _instance;
@@ -28,6 +27,14 @@ class TursoService {
   static const String keyDbToken = 'turso_db_token';
 
   static const Duration _timeoutConexao = Duration(seconds: 20);
+
+  /// Prazo de um lote de gravação inteiro (uma ida e volta). Estourou, a
+  /// fila tenta de novo com o mesmo UUID.
+  static const Duration timeoutGravacao = Duration(seconds: 25);
+
+  /// Prazo das leituras: sem ele, uma consulta pendurada na rede da loja
+  /// deixava a tela girando para sempre.
+  static const Duration timeoutLeitura = Duration(seconds: 30);
 
   LibsqlClient? _client;
   bool _connected = false;
@@ -43,6 +50,92 @@ class TursoService {
 
   bool get isConnected => _connected;
   LibsqlClient? get client => _client;
+
+  /// URL do banco conectado agora — a identidade do banco para a fila.
+  String? get urlAtiva => _urlAtiva;
+
+  /// Conexão própria das gravações. Qualquer falha a aposenta: uma conexão
+  /// que ficou pendurada no meio de um lote não serve para o próximo.
+  LibsqlClient? _clienteEscrita;
+
+  /// Colunas opcionais, lidas uma vez por conexão (ver [EsquemaContagem]).
+  EsquemaContagem? _esquema;
+
+  /// Lê no banco quais colunas de migração existem. Falha de rede lança
+  /// [FalhaGravacao] de rede — nunca vira "coluna ausente".
+  Future<EsquemaContagem> esquema() async {
+    final cache = _esquema;
+    if (cache != null) return cache;
+    final client = _client;
+    if (client == null) {
+      throw const FalhaGravacao(
+        TipoFalhaGravacao.rede,
+        'Sem conexão com o banco online.',
+      );
+    }
+    Future<Set<String>> colunas(String tabela) async {
+      final rows = (await (await client.prepare(
+        "SELECT name FROM pragma_table_info('$tabela')",
+      ))
+          .query()
+          .timeout(timeoutGravacao)) as List<dynamic>;
+      return {
+        for (final dynamic r in rows)
+          if (r is Map<String, dynamic>) r['name'].toString().toLowerCase(),
+      };
+    }
+
+    try {
+      final mestre = await colunas('estoque_mestre');
+      final itens = await colunas('contagem_itens');
+      final lido = EsquemaContagem(
+        // Tabela não lida (vazia) = não dá para afirmar que falta: assume a
+        // coluna, como o dashboard atual.
+        mestreTemObservacoes:
+            mestre.isEmpty || mestre.contains('observacoes'),
+        itensTemConfirmadoEm: itens.isEmpty || itens.contains('confirmado_em'),
+      );
+      _esquema = lido;
+      return lido;
+    } catch (e) {
+      throw classificarFalhaGravacao(e);
+    }
+  }
+
+  /// Manda o lote inteiro numa requisição só (`batch` → pipeline Hrana),
+  /// dentro de BEGIN IMMEDIATE … COMMIT. Lança [FalhaGravacao].
+  Future<void> executarLote(
+    List<String> comandos, {
+    Duration limite = timeoutGravacao,
+  }) async {
+    final url = _urlAtiva;
+    final token = _tokenAtivo;
+    if (!_connected || url == null || token == null) {
+      throw const FalhaGravacao(
+        TipoFalhaGravacao.rede,
+        'Sem conexão com o banco online.',
+      );
+    }
+    final texto = textoDoLote(comandos);
+    LibsqlClient? cliente = _clienteEscrita;
+    try {
+      if (cliente == null) {
+        cliente = LibsqlClient.remote(url, authToken: token);
+        await cliente.connect().timeout(limite);
+        _clienteEscrita = cliente;
+      }
+      await cliente.batch(texto).timeout(limite);
+    } catch (e) {
+      // A próxima tentativa abre outra conexão; a requisição que ficou
+      // pendurada, se um dia completar, completa no vazio — e o UUID impede
+      // que valha duas vezes.
+      if (cliente != null && identical(_clienteEscrita, cliente)) {
+        _clienteEscrita = null;
+        unawaited(cliente.dispose().catchError((_) {}));
+      }
+      throw classificarFalhaGravacao(e);
+    }
+  }
 
   Future<bool> temCredenciais() async {
     final prefs = await SharedPreferences.getInstance();
@@ -86,13 +179,19 @@ class TursoService {
     }
 
     final clienteAntigo = _client;
+    final escritaAntiga = _clienteEscrita;
     _connected = false;
     _client = null;
+    _clienteEscrita = null;
+    _esquema = null;
     _urlAtiva = null;
     _tokenAtivo = null;
 
     if (clienteAntigo != null) {
       unawaited(clienteAntigo.dispose().catchError((_) {}));
+    }
+    if (escritaAntiga != null) {
+      unawaited(escritaAntiga.dispose().catchError((_) {}));
     }
 
     if (url.isEmpty || token.isEmpty) {
