@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'config_page.dart';
@@ -108,7 +110,10 @@ class _ContagemPageState extends State<ContagemPage>
       if (!mounted) return;
       setState(() {
         _carregando = false;
-        _erro = 'Falha ao carregar a lista: $e';
+        _erro = e is TimeoutException
+            ? 'O banco demorou demais para responder — verifique a internet '
+                'e tente de novo.'
+            : 'Falha ao carregar a lista: $e';
       });
     }
   }
