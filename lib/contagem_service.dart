@@ -2,6 +2,7 @@ import 'package:libsql_dart/libsql_dart.dart';
 
 import 'agrupamento.dart';
 import 'enderecos.dart';
+import 'gravacao_lote.dart';
 import 'turso_service.dart';
 
 export 'agrupamento.dart'
@@ -184,24 +185,9 @@ class ContagemService {
   factory ContagemService() => _instance;
   ContagemService._internal();
 
-  /// Teto para a carga da lista. Sem ele, uma rede que aceita a conexão e
-  /// para de responder deixava a tela girando para sempre.
-  static const Duration _timeoutCarga = Duration(seconds: 40);
-
   Future<LibsqlClient?> _conexao() async {
     if (!await TursoService().garantirConexao()) return null;
     return TursoService().client;
-  }
-
-  /// Fuso de Brasília. O dashboard grava todos os carimbos de data em BRT
-  /// (`datetime('now', '-3 hours')` nos triggers, `_BRT` no Python) e o
-  /// app tem de gravar no mesmo fuso — senão a contagem de hoje cai no dia
-  /// errado do inventário cíclico para quem confere depois das 21h.
-  static String _agoraBrt() {
-    final t = DateTime.now().toUtc().subtract(const Duration(hours: 3));
-    String d2(int n) => n.toString().padLeft(2, '0');
-    return '${t.year}-${d2(t.month)}-${d2(t.day)} '
-        '${d2(t.hour)}:${d2(t.minute)}:${d2(t.second)}';
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -210,7 +196,14 @@ class ContagemService {
 
   /// Carrega a lista de contagem, agrupa os códigos do mesmo produto e cruza
   /// cada item com as posições do app Gôndolas.
-  Future<ListaContagem> carregar() async {
+  ///
+  /// Tem prazo ([TursoService.timeoutLeitura]): estourou, lança
+  /// TimeoutException e a tela mostra o erro com "tentar de novo", em vez de
+  /// girar para sempre.
+  Future<ListaContagem> carregar() =>
+      _carregarLista().timeout(TursoService.timeoutLeitura);
+
+  Future<ListaContagem> _carregarLista() async {
     final client = await _conexao();
     if (client == null) return ListaContagem.vazia;
 
@@ -240,8 +233,7 @@ class ContagemService {
     // Future.wait com eagerError: uma falha em `linhas` aparece na hora, e
     // as demais (que já engolem os próprios erros) não ficam sem dono.
     await Future.wait<void>([fLinhas, fMestre, fMapa, fEnderecos],
-            eagerError: true)
-        .timeout(_timeoutCarga);
+        eagerError: true);
 
     final linhas = await fLinhas;
     if (linhas.isEmpty) return ListaContagem.vazia;
@@ -562,24 +554,33 @@ class ContagemService {
     final client = await _conexao();
     if (client == null) return const [];
     final abertas = <DivergenciaAberta>[];
-    for (final c in item.codigos) {
-      try {
+    if (item.codigos.isEmpty) return abertas;
+    // Uma consulta só para todos os códigos, com prazo curto: é um aviso
+    // antes de registrar, e não pode prender a folha de divergência quando
+    // a rede está ruim.
+    final marcas = List.filled(item.codigos.length, 'UPPER(TRIM(?))').join(', ');
+    try {
+      Future<dynamic> consultar() async {
         final stmt = await client.prepare(
           'SELECT cooperado, delta, status FROM divergencias '
-          'WHERE UPPER(TRIM(codigo)) = UPPER(TRIM(?))',
+          'WHERE UPPER(TRIM(codigo)) IN ($marcas)',
         );
-        final rows = (await stmt.query(positional: [c.codigo])) as List<dynamic>;
-        for (final dynamic row in rows) {
-          if (row is! Map<String, dynamic>) continue;
-          abertas.add(DivergenciaAberta(
-            cooperado: _asString(row['cooperado']),
-            delta: _asInt(row['delta']),
-            status: _asString(row['status']),
-          ));
-        }
-      } catch (_) {
-        // Um código que falha não pode esconder as divergências dos outros.
+        return stmt
+            .query(positional: [for (final c in item.codigos) c.codigo]);
       }
+
+      final rows = (await consultar().timeout(const Duration(seconds: 10)))
+          as List<dynamic>;
+      for (final dynamic row in rows) {
+        if (row is! Map<String, dynamic>) continue;
+        abertas.add(DivergenciaAberta(
+          cooperado: _asString(row['cooperado']),
+          delta: _asInt(row['delta']),
+          status: _asString(row['status']),
+        ));
+      }
+    } catch (_) {
+      // Sem a consulta a folha abre sem o aviso — melhor do que travada.
     }
     return abertas;
   }
@@ -588,48 +589,25 @@ class ContagemService {
   // Escrita
   // ───────────────────────────────────────────────────────────────────────────
 
-  /// Marca o produto como conferido e certo — o botão "OK ✓".
+  /// Monta a conferência "OK ✓" para a fila.
   ///
   /// Resolve TODAS as linhas de `contagem_itens` do produto e limpa a
   /// situação de TODOS os seus códigos: a pilha foi conferida por inteiro, e
   /// deixar o código irmão pendente pediria uma segunda contagem da mesma
-  /// prateleira.
-  Future<bool> confirmarCerta(ItemContagem item) async {
-    final client = await _conexao();
-    if (client == null) return false;
-    final agora = _agoraBrt();
+  /// prateleira. O SQL está em [OperacaoContagem.comandos].
+  Future<OperacaoContagem> operacaoCerta(ItemContagem item) async =>
+      OperacaoContagem(
+        uuid: novoUuid(),
+        tipo: TipoOperacao.certa,
+        banco: await _bancoAtual(),
+        criadaEm: DateTime.now(),
+        ids: item.ids,
+        codigos: [for (final c in item.codigos) c.codigo],
+        produto: item.produto,
+        categoria: item.categoria,
+      );
 
-    try {
-      // Estoque mestre ANTES de contagem_itens: os triggers
-      // trig_contagem_to_cicli / trig_contagem_status_ciclo disparam na
-      // mudança de status de contagem_itens e leem qtd_fisica do mestre. Com
-      // esta ordem eles já enxergam o valor final.
-      for (final c in item.codigos) {
-        final stmtMestre = await client.prepare(
-          "UPDATE estoque_mestre SET status = 'ok', qtd_fisica = qtd_sistema, "
-          "diferenca = 0, nota = '', ultima_contagem = ? "
-          "WHERE codigo = ? AND status IN ('falta', 'sobra')",
-        );
-        await stmtMestre.query(positional: [agora, c.codigo]);
-
-        final stmtDel = await client.prepare(
-          'DELETE FROM divergencias WHERE codigo = ?',
-        );
-        await stmtDel.query(positional: [c.codigo]);
-      }
-
-      for (final id in item.ids) {
-        await _marcarItem(client, id, 'certa', '', 0, agora);
-      }
-
-      TursoService().dataRevision.value++;
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  /// Registra uma divergência — o botão "DIVERGÊNCIA".
+  /// Monta a divergência — o botão "DIVERGÊNCIA" — para a fila.
   ///
   /// [qtdDivergindo] é sempre positiva; [sobra] diz o sentido, e os dois se
   /// referem ao TOTAL do produto (soma de todos os códigos).
@@ -638,24 +616,14 @@ class ContagemService {
   /// pilha na prateleira não distingue código, mas `estoque_mestre` e
   /// `divergencias` são por código e é preciso escolher um. Os irmãos ficam
   /// com o saldo intacto, então a soma do produto continua batendo com o que
-  /// foi contado — `ancora + delta` mais os irmãos inalterados dá exatamente
-  /// a quantidade contada.
-  Future<bool> registrarDivergencia({
+  /// foi contado.
+  Future<OperacaoContagem> operacaoDivergencia({
     required ItemContagem item,
     required int qtdDivergindo,
     required bool sobra,
     required String motivo,
     bool confirmarApenas = false,
   }) async {
-    final client = await _conexao();
-    if (client == null) return false;
-
-    final agora = _agoraBrt();
-    final qtd = qtdDivergindo.abs();
-    final delta = sobra ? qtd : -qtd;
-    final statusEstoque = sobra ? 'sobra' : 'falta';
-    final motivoLimpo = motivo.trim();
-
     // Saldo do próprio código âncora — a diferença do produto é aplicada
     // sobre ele, não sobre o total.
     final ancora = item.codigos.firstWhere(
@@ -666,111 +634,26 @@ class ContagemService {
         naLista: true,
       ),
     );
-    final qtdFisicaAncora = (ancora.quantidade + delta).clamp(0, 1 << 31);
-    final diferencaAncora = qtdFisicaAncora - ancora.quantidade;
-
-    try {
-      // 1. Estoque mestre primeiro — ver comentário em confirmarCerta.
-      //    `observacoes` é coluna de migração; se não existir, grava sem ela.
-      try {
-        final stmt = await client.prepare(
-          'UPDATE estoque_mestre SET status = ?, qtd_fisica = ?, diferenca = ?, '
-          'nota = ?, observacoes = ?, ultima_contagem = ? WHERE codigo = ?',
-        );
-        await stmt.query(positional: [
-          statusEstoque,
-          qtdFisicaAncora,
-          diferencaAncora,
-          motivoLimpo,
-          motivoLimpo,
-          agora,
-          ancora.codigo,
-        ]);
-      } catch (_) {
-        final stmt = await client.prepare(
-          'UPDATE estoque_mestre SET status = ?, qtd_fisica = ?, diferenca = ?, '
-          'nota = ?, ultima_contagem = ? WHERE codigo = ?',
-        );
-        await stmt.query(positional: [
-          statusEstoque,
-          qtdFisicaAncora,
-          diferencaAncora,
-          motivoLimpo,
-          agora,
-          ancora.codigo,
-        ]);
-      }
-
-      // 2. Registro da divergência para a aba Divergências do dashboard.
-      //    Pulado quando o conferente só está confirmando uma já existente.
-      if (!confirmarApenas) {
-        final stmtDiv = await client.prepare(
-          'INSERT INTO divergencias '
-          '(codigo, produto, categoria, delta, status, cooperado, criado_em) '
-          'VALUES (?, ?, ?, ?, ?, ?, ?)',
-        );
-        await stmtDiv.query(positional: [
-          ancora.codigo,
-          item.produto,
-          item.categoria,
-          delta,
-          statusEstoque,
-          motivoLimpo,
-          agora,
-        ]);
-
-        final stmtHist = await client.prepare(
-          'INSERT INTO historico_divergencias '
-          '(codigo, produto, categoria, cooperado, delta, status, criado_em) '
-          'VALUES (?, ?, ?, ?, ?, ?, ?)',
-        );
-        await stmtHist.query(positional: [
-          ancora.codigo,
-          item.produto,
-          item.categoria,
-          motivoLimpo,
-          delta,
-          statusEstoque,
-          agora,
-        ]);
-      }
-
-      // 3. Itens da contagem por último — disparam os triggers do cíclico.
-      for (final id in item.ids) {
-        await _marcarItem(client, id, 'divergencia', motivoLimpo, qtd, agora);
-      }
-
-      TursoService().dataRevision.value++;
-      return true;
-    } catch (_) {
-      return false;
-    }
+    return OperacaoContagem(
+      uuid: novoUuid(),
+      tipo: TipoOperacao.divergencia,
+      banco: await _bancoAtual(),
+      criadaEm: DateTime.now(),
+      ids: item.ids,
+      codigos: [for (final c in item.codigos) c.codigo],
+      produto: item.produto,
+      categoria: item.categoria,
+      codigoAncora: ancora.codigo,
+      qtdAncora: ancora.quantidade,
+      qtdDivergindo: qtdDivergindo.abs(),
+      sobra: sobra,
+      motivo: motivo.trim(),
+      confirmarApenas: confirmarApenas,
+    );
   }
 
-  /// Grava o status de uma linha de `contagem_itens`.
-  ///
-  /// `confirmado_em` é coluna de migração do dashboard: onde ela não existe,
-  /// regrava sem ela em vez de derrubar a confirmação inteira.
-  Future<void> _marcarItem(
-    LibsqlClient client,
-    int id,
-    String status,
-    String motivo,
-    int qtdDivergencia,
-    String agora,
-  ) async {
-    try {
-      final stmt = await client.prepare(
-        'UPDATE contagem_itens SET status = ?, motivo = ?, '
-        'qtd_divergencia = ?, confirmado_em = ? WHERE id = ?',
-      );
-      await stmt.query(positional: [status, motivo, qtdDivergencia, agora, id]);
-    } catch (_) {
-      final stmt = await client.prepare(
-        'UPDATE contagem_itens SET status = ?, motivo = ?, '
-        'qtd_divergencia = ? WHERE id = ?',
-      );
-      await stmt.query(positional: [status, motivo, qtdDivergencia, id]);
-    }
-  }
+  /// O banco em que a conferência está sendo feita: o conectado, ou o
+  /// configurado quando a conexão ainda não subiu.
+  Future<String> _bancoAtual() async =>
+      TursoService().urlAtiva ?? (await TursoService().lerCredenciais()).$1;
 }

@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 import 'config_page.dart';
 import 'contagem_service.dart';
 import 'divergencia_sheet.dart';
+import 'fila_gravacao.dart';
+import 'fila_gravacao_ui.dart';
+import 'gravacao_lote.dart';
 import 'item_card.dart';
 import 'tema.dart';
 import 'turso_service.dart';
@@ -41,14 +44,21 @@ class _ContagemPageState extends State<ContagemPage>
   Filtro _filtro = Filtro.pendentes;
   String _busca = '';
 
-  /// Ids com gravação em andamento — trava os botões daquele card.
+  /// Ids sendo guardados na fila agora (frações de segundo: é só o disco
+  /// do aparelho) — trava os botões contra o toque duplo.
   final Set<int> _gravando = {};
 
-  /// Status gravados por este aparelho, com o número da escrita que os
-  /// gravou. Um recarregamento que começou antes da escrita terminar traz do
-  /// banco a foto velha (item ainda pendente) e, ao chegar, devolveria à
-  /// lista um item que o conferente acabou de marcar. Com isto, o resultado
-  /// dele é corrigido pelas escritas que terminaram durante a consulta.
+  /// Conferências guardadas no aparelho e ainda não confirmadas pelo banco.
+  /// A tela mostra o item já conferido (ver [_listaVisivel]); a fila leva ao
+  /// banco quando a rede deixar.
+  final FilaGravacao _fila = FilaGravacao();
+  StreamSubscription<EventoFila>? _eventosFila;
+
+  /// Status confirmados pelo banco, com o número da confirmação. Um
+  /// recarregamento que começou antes da confirmação traz do banco a foto
+  /// velha (item ainda pendente) e, ao chegar, devolveria à lista um item
+  /// que o conferente acabou de marcar. Com isto, o resultado dele é
+  /// corrigido pelas confirmações que chegaram durante a consulta.
   final Map<int, (StatusContagem, int)> _escritasLocais = {};
   int _ultimaEscrita = 0;
 
@@ -58,14 +68,52 @@ class _ContagemPageState extends State<ContagemPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _fila.addListener(_aoMudarFila);
+    _eventosFila = _fila.eventos.listen(_aoSairDaFila);
+    unawaited(_fila.carregar());
     _carregar();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _fila.removeListener(_aoMudarFila);
+    _eventosFila?.cancel();
     _buscaCtrl.dispose();
     super.dispose();
+  }
+
+  void _aoMudarFila() {
+    if (mounted) setState(() {});
+  }
+
+  /// Uma conferência saiu da fila: gravada (fica conferida de vez) ou
+  /// recusada pelo banco (volta a pendente, com aviso do porquê).
+  void _aoSairDaFila(EventoFila evento) {
+    if (!mounted) return;
+    final op = evento.operacao;
+    if (evento.gravada) {
+      final novo = op.tipo == TipoOperacao.certa
+          ? StatusContagem.certa
+          : StatusContagem.divergencia;
+      final escrita = ++_ultimaEscrita;
+      final ids = op.ids.toSet();
+      for (final id in op.ids) {
+        _escritasLocais[id] = (novo, escrita);
+      }
+      setState(() {
+        _lista = _listaCom([
+          for (final i in _lista.itens)
+            if (i.ids.any(ids.contains)) i.comStatus(novo) else i,
+        ]);
+      });
+      return;
+    }
+    for (final id in op.ids) {
+      _escritasLocais.remove(id);
+    }
+    _avisar(mensagemFalhaFila(evento), erro: true);
+    if (!_carregando) _carregar();
   }
 
   /// O Android devolve o app minimizado com a lista de quando ele foi aberto.
@@ -74,11 +122,10 @@ class _ContagemPageState extends State<ContagemPage>
   /// recarrega no meio de uma gravação, para não trocar o card embaixo dela.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed &&
-        !_carregando &&
-        _gravando.isEmpty) {
-      _carregar();
-    }
+    if (state != AppLifecycleState.resumed) return;
+    // Voltar ao app é a hora mais provável de a rede ter voltado.
+    _fila.tentarAgora();
+    if (!_carregando && _gravando.isEmpty) _carregar();
   }
 
   Future<void> _carregar() async {
@@ -91,9 +138,17 @@ class _ContagemPageState extends State<ContagemPage>
     if (!mounted) return;
 
     if (!conectou) {
+      final motivo = TursoService().ultimoErro ?? 'Não foi possível conectar.';
+      // Com a lista já na tela, perder a rede não pode tirá-la do
+      // conferente: ele continua conferindo e a fila sobe depois.
+      if (_lista.itens.isNotEmpty) {
+        setState(() => _carregando = false);
+        _avisar('Não deu para atualizar a lista: $motivo', erro: true);
+        return;
+      }
       setState(() {
         _carregando = false;
-        _erro = TursoService().ultimoErro ?? 'Não foi possível conectar.';
+        _erro = motivo;
       });
       return;
     }
@@ -108,12 +163,17 @@ class _ContagemPageState extends State<ContagemPage>
       });
     } catch (e) {
       if (!mounted) return;
+      final motivo = e is TimeoutException
+          ? 'o banco demorou demais para responder — verifique a internet.'
+          : '$e';
+      if (_lista.itens.isNotEmpty) {
+        setState(() => _carregando = false);
+        _avisar('Não deu para atualizar a lista: $motivo', erro: true);
+        return;
+      }
       setState(() {
         _carregando = false;
-        _erro = e is TimeoutException
-            ? 'O banco demorou demais para responder — verifique a internet '
-                'e tente de novo.'
-            : 'Falha ao carregar a lista: $e';
+        _erro = 'Falha ao carregar a lista: $motivo';
       });
     }
   }
@@ -147,13 +207,37 @@ class _ContagemPageState extends State<ContagemPage>
         ),
       );
 
-  void _aplicarStatus(ItemContagem item, StatusContagem novo) {
-    _escritasLocais[item.id] = (novo, ++_ultimaEscrita);
-    setState(() {
-      _lista = _listaCom(_lista.itens
-          .map((i) => i.id == item.id ? i.comStatus(novo) : i)
-          .toList());
-    });
+  /// A lista como o conferente deve vê-la: o que veio do banco, com o que
+  /// ainda está na fila por cima. Derivada a cada desenho, então descartar a
+  /// fila ou ter uma conferência recusada devolve o item a pendente sozinho.
+  ListaContagem get _listaVisivel {
+    final pendentes = _fila.pendentes;
+    if (pendentes.isEmpty) return _lista;
+    final naFila = <int, StatusContagem>{};
+    for (final op in pendentes) {
+      final status = op.tipo == TipoOperacao.certa
+          ? StatusContagem.certa
+          : StatusContagem.divergencia;
+      for (final id in op.ids) {
+        naFila[id] = status;
+      }
+    }
+    return _listaCom([
+      for (final i in _lista.itens)
+        if (_statusNaFila(i, naFila) case final status?)
+          i.comStatus(status)
+        else
+          i,
+    ]);
+  }
+
+  static StatusContagem? _statusNaFila(
+      ItemContagem item, Map<int, StatusContagem> naFila) {
+    for (final id in item.ids) {
+      final s = naFila[id];
+      if (s != null) return s;
+    }
+    return null;
   }
 
   void _avisar(String texto, {bool erro = false}) {
@@ -168,18 +252,16 @@ class _ContagemPageState extends State<ContagemPage>
       ));
   }
 
+  /// "OK ✓": guarda no aparelho e marca na hora. A ida ao banco é da fila.
   Future<void> _confirmarCerta(ItemContagem item) async {
+    if (_gravando.contains(item.id)) return;
     setState(() => _gravando.add(item.id));
-    final ok = await ContagemService().confirmarCerta(item);
-    if (!mounted) return;
-    setState(() => _gravando.remove(item.id));
-
-    if (!ok) {
-      _avisar('Não deu para salvar "${item.produto}". Verifique a conexão e '
-          'tente de novo.', erro: true);
-      return;
+    try {
+      final op = await ContagemService().operacaoCerta(item);
+      await _fila.enfileirar(op);
+    } finally {
+      if (mounted) setState(() => _gravando.remove(item.id));
     }
-    _aplicarStatus(item, StatusContagem.certa);
     _avisar('${item.produto} conferido ✓');
   }
 
@@ -187,23 +269,20 @@ class _ContagemPageState extends State<ContagemPage>
     final resultado = await abrirFolhaDivergencia(context, item);
     if (resultado == null || !mounted) return;
 
+    if (_gravando.contains(item.id)) return;
     setState(() => _gravando.add(item.id));
-    final ok = await ContagemService().registrarDivergencia(
-      item: item,
-      qtdDivergindo: resultado.qtdDivergindo,
-      sobra: resultado.sobra,
-      motivo: resultado.motivo,
-      confirmarApenas: resultado.confirmarApenas,
-    );
-    if (!mounted) return;
-    setState(() => _gravando.remove(item.id));
-
-    if (!ok) {
-      _avisar('Não deu para registrar a divergência de "${item.produto}". '
-          'Verifique a conexão e tente de novo.', erro: true);
-      return;
+    try {
+      final op = await ContagemService().operacaoDivergencia(
+        item: item,
+        qtdDivergindo: resultado.qtdDivergindo,
+        sobra: resultado.sobra,
+        motivo: resultado.motivo,
+        confirmarApenas: resultado.confirmarApenas,
+      );
+      await _fila.enfileirar(op);
+    } finally {
+      if (mounted) setState(() => _gravando.remove(item.id));
     }
-    _aplicarStatus(item, StatusContagem.divergencia);
     _avisar(
       '${resultado.sobra ? "Sobra" : "Falta"} de ${resultado.qtdDivergindo} un '
       'registrada em ${item.produto}',
@@ -223,7 +302,7 @@ class _ContagemPageState extends State<ContagemPage>
 
   List<ItemContagem> get _itensVisiveis {
     final termo = _busca.trim().toLowerCase();
-    return _lista.itens.where((i) {
+    return _listaVisivel.itens.where((i) {
       final combinaFiltro = _filtro == Filtro.pendentes
           ? i.status == StatusContagem.pendente
           : i.status != StatusContagem.pendente;
@@ -321,6 +400,7 @@ class _ContagemPageState extends State<ContagemPage>
         backgroundColor: CoresCamda.superficie,
         child: _corpo(),
       ),
+      bottomNavigationBar: BarraFilaGravacao(fila: _fila),
     );
   }
 
@@ -337,7 +417,8 @@ class _ContagemPageState extends State<ContagemPage>
         acaoSecundaria: ('Configurar conexão', _abrirConfig),
       );
     }
-    if (_lista.resumo.total == 0) {
+    final lista = _listaVisivel;
+    if (lista.resumo.total == 0) {
       return _EstadoVazio(
         icone: Icons.inventory_2_outlined,
         titulo: 'Nenhuma contagem em aberto',
@@ -359,7 +440,7 @@ class _ContagemPageState extends State<ContagemPage>
             padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
             child: Column(
               children: [
-                _BarraResumo(resumo: _lista.resumo),
+                _BarraResumo(resumo: lista.resumo),
                 const SizedBox(height: 12),
                 TextField(
                   controller: _buscaCtrl,
@@ -392,7 +473,7 @@ class _ContagemPageState extends State<ContagemPage>
             ),
           ),
         ),
-        if (_lista.resumo.concluida && _filtro == Filtro.pendentes)
+        if (lista.resumo.concluida && _filtro == Filtro.pendentes)
           const SliverToBoxAdapter(child: _BannerConcluida()),
         if (visiveis.isEmpty)
           SliverFillRemaining(
