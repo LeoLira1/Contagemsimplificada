@@ -207,19 +207,44 @@ class ContagemService {
     final client = await _conexao();
     if (client == null) return ListaContagem.vazia;
 
-    final linhas = await _carregarLinhas(client);
-    if (linhas.isEmpty) return ListaContagem.vazia;
+    // As consultas não dependem uma da outra, então saem todas de uma vez,
+    // espalhadas pelas conexões de leitura (ver TursoService.clientesLeitura).
+    // Em fila, numa conexão só, eram 14 idas ao servidor uma atrás da outra;
+    // assim a espera é a da consulta mais lenta, não a soma de todas.
+    //
+    // Consultas que caem na MESMA conexão continuam em fila dentro dela, por
+    // isso a mais pesada (linhas) fica sozinha na primeira.
+    final leitores = TursoService().clientesLeitura;
+    LibsqlClient leitor(int i) =>
+        leitores.isEmpty ? client : leitores[i % leitores.length];
 
+    final fLinhas = _carregarLinhas(leitor(0));
     // O mestre inteiro é preciso porque o código irmão pode NÃO estar na
     // lista de contagem: no PHOSFIX só o `222534` foi pedido, e é o
     // `US222534` que carrega 73 das 84 unidades da prateleira.
-    final mestre = await _carregarMestre(client);
-    final mapa = await _carregarMapa(client);
+    final fMestre = _carregarMestre(leitor(1));
+    final fMapa = _carregarMapa(leitor(2));
+    final fEnderecos = _carregarEnderecos(
+      localizado: leitor(3),
+      estante: leitor(1),
+      gondola: leitor(3),
+    );
+
+    // Future.wait com eagerError: uma falha em `linhas` aparece na hora, e
+    // as demais (que já engolem os próprios erros) não ficam sem dono.
+    await Future.wait<void>([fLinhas, fMestre, fMapa, fEnderecos],
+        eagerError: true);
+
+    final linhas = await fLinhas;
+    if (linhas.isEmpty) return ListaContagem.vazia;
+
+    final mestre = await fMestre;
+    final mapa = await fMapa;
 
     final agrupados =
         agruparItens(linhas: linhas, mestre: mestre, mapa: mapa);
 
-    final enderecos = await _carregarEnderecos(client);
+    final enderecos = await fEnderecos;
     final itens = [
       for (final g in agrupados)
         ItemContagem(
@@ -404,26 +429,42 @@ class ContagemService {
   ///
   /// Um produto endereçado mas nunca contado só aparece nas duas últimas — e é
   /// justamente quem mais precisa aparecer na tela do conferente.
-  Future<Map<String, List<EnderecoProduto>>> _carregarEnderecos(
-      LibsqlClient client) async {
-    final porCodigo = <String, List<EnderecoProduto>>{};
-    final vistos = <String>{};
-
-    void adicionar(EnderecoProduto e) {
-      if (!vistos.add(e.chave)) return;
-      porCodigo
-          .putIfAbsent(normalizarCodigo(e.produtoCodigo), () => [])
-          .add(e);
-    }
-
-    // 1. estoque_localizado — endereço COM quantidade. Vem primeiro para que
-    //    a deduplicação preserve a quantidade quando o mesmo endereço também
-    //    estiver no layout.
-    //
+  Future<Map<String, List<EnderecoProduto>>> _carregarEnderecos({
+    required LibsqlClient localizado,
+    required LibsqlClient estante,
+    required LibsqlClient gondola,
+  }) async {
     // As três consultas varrem a tabela inteira em vez de filtrar pela
     // contagem: agora que os endereços são procurados por TODOS os códigos do
     // grupo — inclusive os que não estão em `contagem_itens` —, um JOIN com
     // ela deixaria de fora justamente o irmão endereçado.
+    //
+    // Saem juntas, cada uma na conexão que recebeu; a ordem só importa na
+    // hora de juntar, logo abaixo.
+    final fLocalizado = _enderecosLocalizados(localizado);
+    final fEstante = _enderecosEstante(estante);
+    final fGondola = _enderecosGondola(gondola);
+
+    final porCodigo = <String, List<EnderecoProduto>>{};
+    final vistos = <String>{};
+
+    // `estoque_localizado` (endereço COM quantidade) entra primeiro para que
+    // a deduplicação preserve a quantidade quando o mesmo endereço também
+    // estiver no layout.
+    for (final lista in [await fLocalizado, await fEstante, await fGondola]) {
+      for (final e in lista) {
+        if (!vistos.add(e.chave)) continue;
+        porCodigo
+            .putIfAbsent(normalizarCodigo(e.produtoCodigo), () => [])
+            .add(e);
+      }
+    }
+    return porCodigo;
+  }
+
+  /// `estoque_localizado` — endereço + quantidade contada ali (app Gôndolas).
+  Future<List<EnderecoProduto>> _enderecosLocalizados(
+      LibsqlClient client) async {
     try {
       const sql = '''
         SELECT produto_codigo, local_tipo, local_num,
@@ -431,72 +472,78 @@ class ContagemService {
         FROM estoque_localizado
       ''';
       final rows = (await (await client.prepare(sql)).query()) as List<dynamic>;
-      for (final dynamic row in rows) {
-        if (row is! Map<String, dynamic>) continue;
-        adicionar(EnderecoProduto(
-          produtoCodigo: _asString(row['produto_codigo']).trim(),
-          localTipo: _asString(row['local_tipo']).trim() == 'gondola'
-              ? 'gondola'
-              : 'estante',
-          localNum: _asInt(row['local_num']),
-          faceOuColuna: _asInt(row['face_ou_coluna']),
-          andarOuNivel: _asInt(row['andar_ou_nivel']),
-          quantidade: _asDouble(row['quantidade']),
-        ));
-      }
+      return [
+        for (final dynamic row in rows)
+          if (row is Map<String, dynamic>)
+            EnderecoProduto(
+              produtoCodigo: _asString(row['produto_codigo']).trim(),
+              localTipo: _asString(row['local_tipo']).trim() == 'gondola'
+                  ? 'gondola'
+                  : 'estante',
+              localNum: _asInt(row['local_num']),
+              faceOuColuna: _asInt(row['face_ou_coluna']),
+              andarOuNivel: _asInt(row['andar_ou_nivel']),
+              quantidade: _asDouble(row['quantidade']),
+            ),
+      ];
     } catch (_) {
       // Banco sem as tabelas do app Gôndolas: a contagem funciona sem
       // endereço, apenas sem as duas linhas do meio do card.
+      return const [];
     }
+  }
 
-    // 2. estante_layout — cadastro de posição em estante/expositor/palete.
-    //    `slot` é ignorado: dois slots da mesma célula são a mesma posição
-    //    etiquetada na prateleira, e repetir "Posição H" três vezes no card
-    //    não ajuda ninguém.
+  /// `estante_layout` — cadastro de posição em estante/expositor/palete.
+  /// `slot` é ignorado: dois slots da mesma célula são a mesma posição
+  /// etiquetada na prateleira, e repetir "Posição H" três vezes no card não
+  /// ajuda ninguém.
+  Future<List<EnderecoProduto>> _enderecosEstante(LibsqlClient client) async {
     try {
       const sql = '''
         SELECT DISTINCT produto_codigo, estante_num, coluna, nivel
         FROM estante_layout
       ''';
       final rows = (await (await client.prepare(sql)).query()) as List<dynamic>;
-      for (final dynamic row in rows) {
-        if (row is! Map<String, dynamic>) continue;
-        adicionar(EnderecoProduto(
-          produtoCodigo: _asString(row['produto_codigo']).trim(),
-          localTipo: 'estante',
-          localNum: _asInt(row['estante_num']),
-          faceOuColuna: _asInt(row['coluna']),
-          andarOuNivel: _asInt(row['nivel']),
-        ));
-      }
+      return [
+        for (final dynamic row in rows)
+          if (row is Map<String, dynamic>)
+            EnderecoProduto(
+              produtoCodigo: _asString(row['produto_codigo']).trim(),
+              localTipo: 'estante',
+              localNum: _asInt(row['estante_num']),
+              faceOuColuna: _asInt(row['coluna']),
+              andarOuNivel: _asInt(row['nivel']),
+            ),
+      ];
     } catch (_) {
-      // idem
+      return const [];
     }
+  }
 
-    // 3. gondola_layout — a face não é persistida, é derivada de pos_x/pos_z
-    //    (mesma regra do app Gôndolas, ver faceFromPos).
+  /// `gondola_layout` — a face não é persistida, é derivada de pos_x/pos_z
+  /// (mesma regra do app Gôndolas, ver faceFromPos).
+  Future<List<EnderecoProduto>> _enderecosGondola(LibsqlClient client) async {
     try {
       const sql = '''
         SELECT produto_codigo, gondola_num, andar, pos_x, pos_z
         FROM gondola_layout
       ''';
       final rows = (await (await client.prepare(sql)).query()) as List<dynamic>;
-      for (final dynamic row in rows) {
-        if (row is! Map<String, dynamic>) continue;
-        adicionar(EnderecoProduto(
-          produtoCodigo: _asString(row['produto_codigo']).trim(),
-          localTipo: 'gondola',
-          localNum: _asInt(row['gondola_num']),
-          faceOuColuna:
-              faceFromPos(_asDouble(row['pos_x']), _asDouble(row['pos_z'])),
-          andarOuNivel: _asInt(row['andar']),
-        ));
-      }
+      return [
+        for (final dynamic row in rows)
+          if (row is Map<String, dynamic>)
+            EnderecoProduto(
+              produtoCodigo: _asString(row['produto_codigo']).trim(),
+              localTipo: 'gondola',
+              localNum: _asInt(row['gondola_num']),
+              faceOuColuna:
+                  faceFromPos(_asDouble(row['pos_x']), _asDouble(row['pos_z'])),
+              andarOuNivel: _asInt(row['andar']),
+            ),
+      ];
     } catch (_) {
-      // idem
+      return const [];
     }
-
-    return porCodigo;
   }
 
   /// Divergências ainda abertas para o produto — em qualquer um dos seus

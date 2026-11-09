@@ -28,6 +28,15 @@ class TursoService {
 
   static const Duration _timeoutConexao = Duration(seconds: 20);
 
+  /// Conexões extras, só de leitura, usadas para carregar a lista.
+  ///
+  /// O cliente remoto do libsql manda um pedido de cada vez por conexão, e
+  /// cada consulta são duas idas ao servidor (descrever + executar). As sete
+  /// consultas da lista, numa conexão só, viravam 14 idas em fila — com o
+  /// 4G da loja, vários segundos de tela vazia. Espalhadas por conexões
+  /// separadas elas andam ao mesmo tempo.
+  static const int _leitoresExtras = 3;
+
   /// Prazo de um lote de gravação inteiro (uma ida e volta). Estourou, a
   /// fila tenta de novo com o mesmo UUID.
   static const Duration timeoutGravacao = Duration(seconds: 25);
@@ -37,6 +46,7 @@ class TursoService {
   static const Duration timeoutLeitura = Duration(seconds: 30);
 
   LibsqlClient? _client;
+  List<LibsqlClient> _leitores = const [];
   bool _connected = false;
   String? _urlAtiva;
   String? _tokenAtivo;
@@ -50,6 +60,15 @@ class TursoService {
 
   bool get isConnected => _connected;
   LibsqlClient? get client => _client;
+
+  /// Conexões disponíveis para leitura em paralelo: a principal e as extras.
+  /// Vazia quando não há conexão. As gravações não passam por aqui: têm a
+  /// conexão própria delas (ver [executarLote]).
+  List<LibsqlClient> get clientesLeitura {
+    final principal = _client;
+    if (!_connected || principal == null) return const [];
+    return [principal, ..._leitores];
+  }
 
   /// URL do banco conectado agora — a identidade do banco para a fila.
   String? get urlAtiva => _urlAtiva;
@@ -178,17 +197,18 @@ class TursoService {
       return;
     }
 
-    final clienteAntigo = _client;
+    final antigos = [if (_client != null) _client!, ..._leitores];
     final escritaAntiga = _clienteEscrita;
     _connected = false;
     _client = null;
+    _leitores = const [];
     _clienteEscrita = null;
     _esquema = null;
     _urlAtiva = null;
     _tokenAtivo = null;
 
-    if (clienteAntigo != null) {
-      unawaited(clienteAntigo.dispose().catchError((_) {}));
+    for (final antigo in antigos) {
+      unawaited(antigo.dispose().catchError((_) {}));
     }
     if (escritaAntiga != null) {
       unawaited(escritaAntiga.dispose().catchError((_) {}));
@@ -203,6 +223,7 @@ class TursoService {
       final client = LibsqlClient.remote(url, authToken: token);
       await client.connect().timeout(_timeoutConexao);
       _client = client;
+      _leitores = await _abrirLeitores(url, token);
       _connected = true;
       _urlAtiva = url;
       _tokenAtivo = token;
@@ -212,6 +233,22 @@ class TursoService {
       _client = null;
       ultimoErro = _descreverErro(e);
     }
+  }
+
+  /// Abre as conexões extras de leitura. Se alguma falhar, segue com as que
+  /// abriram (ou nenhuma): a lista carrega do mesmo jeito, só mais devagar.
+  Future<List<LibsqlClient>> _abrirLeitores(String url, String token) async {
+    final abertos = <LibsqlClient>[];
+    for (var i = 0; i < _leitoresExtras; i++) {
+      try {
+        final leitor = LibsqlClient.remote(url, authToken: token);
+        await leitor.connect().timeout(_timeoutConexao);
+        abertos.add(leitor);
+      } catch (_) {
+        break;
+      }
+    }
+    return abertos;
   }
 
   Future<bool> garantirConexao() async {
