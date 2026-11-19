@@ -197,11 +197,20 @@ class ContagemService {
   /// Carrega a lista de contagem, agrupa os códigos do mesmo produto e cruza
   /// cada item com as posições do app Gôndolas.
   ///
-  /// Tem prazo ([TursoService.timeoutLeitura]): estourou, lança
-  /// TimeoutException e a tela mostra o erro com "tentar de novo", em vez de
-  /// girar para sempre.
-  Future<ListaContagem> carregar() =>
-      _carregarLista().timeout(TursoService.timeoutLeitura);
+  /// Tem prazo ([TursoService.timeoutLeitura]) por tentativa. Se a primeira
+  /// estourar ou falhar, as conexões de leitura são trocadas por novas e a
+  /// lista é pedida mais uma vez: quase sempre o que travou foi um socket
+  /// morto guardado pelo cliente HTTP (ver
+  /// [TursoService.renovarConexoesLeitura]), e insistir nele só repetiria o
+  /// erro. Falhou de novo, lança e a tela avisa.
+  Future<ListaContagem> carregar() async {
+    try {
+      return await _carregarLista().timeout(TursoService.timeoutLeitura);
+    } catch (_) {
+      if (!await TursoService().renovarConexoesLeitura()) rethrow;
+      return _carregarLista().timeout(TursoService.timeoutLeitura);
+    }
+  }
 
   Future<ListaContagem> _carregarLista() async {
     final client = await _conexao();

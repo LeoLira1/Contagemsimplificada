@@ -41,9 +41,11 @@ class TursoService {
   /// fila tenta de novo com o mesmo UUID.
   static const Duration timeoutGravacao = Duration(seconds: 25);
 
-  /// Prazo das leituras: sem ele, uma consulta pendurada na rede da loja
-  /// deixava a tela girando para sempre.
-  static const Duration timeoutLeitura = Duration(seconds: 30);
+  /// Prazo de UMA tentativa de carregar a lista. As consultas levam menos de
+  /// meio segundo no servidor e a lista inteira tem ~600 KB: passar disto é
+  /// conexão pendurada, não banco lento. Estourou, o carregamento troca as
+  /// conexões ([renovarConexoesLeitura]) e tenta mais uma vez.
+  static const Duration timeoutLeitura = Duration(seconds: 15);
 
   LibsqlClient? _client;
   List<LibsqlClient> _leitores = const [];
@@ -51,6 +53,9 @@ class TursoService {
   String? _urlAtiva;
   String? _tokenAtivo;
   Future<void>? _initEmAndamento;
+
+  /// Pedido de troca das conexões de leitura, atendido pelo próximo [_init].
+  bool _renovarLeitura = false;
 
   /// Motivo da última falha de conexão, em texto curto para o usuário.
   String? ultimoErro;
@@ -194,8 +199,13 @@ class TursoService {
     final (url, token) = await lerCredenciais();
 
     if (_connected && _client != null && url == _urlAtiva && token == _tokenAtivo) {
+      if (_renovarLeitura) {
+        _renovarLeitura = false;
+        await _trocarLeitores(url, token);
+      }
       return;
     }
+    _renovarLeitura = false;
 
     final antigos = [if (_client != null) _client!, ..._leitores];
     final escritaAntiga = _clienteEscrita;
@@ -249,6 +259,45 @@ class TursoService {
       }
     }
     return abertos;
+  }
+
+  /// Joga fora as conexões de leitura e abre outras, com socket novo.
+  ///
+  /// Por que existe: cada [LibsqlClient] remoto guarda a conexão HTTP aberta
+  /// para reaproveitar, e o cliente HTTP do libsql (hyper) não tem prazo
+  /// nenhum. Quando o celular apaga a tela, troca de Wi-Fi para 4G ou a
+  /// operadora derruba a conexão ociosa, o socket guardado morre sem avisar.
+  /// A próxima consulta é escrita nele e fica esperando uma resposta que
+  /// nunca vem — e, como a conexão do libsql atende um pedido de cada vez
+  /// (trava interna do stream Hrana), TODAS as consultas seguintes naquele
+  /// cliente ficam na fila atrás dela. O `.timeout` do Dart só desiste de
+  /// esperar; o pedido continua pendurado lá dentro, segurando a trava.
+  ///
+  /// Sem trocar o cliente, o app repetia "o banco demorou demais" a cada
+  /// recarga até ser fechado. As gravações não passam por aqui: a fila já
+  /// aposenta a conexão dela a cada falha ([executarLote]).
+  Future<bool> renovarConexoesLeitura() async {
+    _renovarLeitura = true;
+    await init();
+    return _connected && _client != null;
+  }
+
+  Future<void> _trocarLeitores(String url, String token) async {
+    final antigos = [if (_client != null) _client!, ..._leitores];
+    try {
+      final novo = LibsqlClient.remote(url, authToken: token);
+      await novo.connect().timeout(_timeoutConexao);
+      _client = novo;
+      _leitores = await _abrirLeitores(url, token);
+      ultimoErro = null;
+    } catch (e) {
+      // Não abriu o novo: fica com os antigos, que podem ainda servir.
+      ultimoErro = _descreverErro(e);
+      return;
+    }
+    for (final antigo in antigos) {
+      unawaited(antigo.dispose().catchError((_) {}));
+    }
   }
 
   Future<bool> garantirConexao() async {
