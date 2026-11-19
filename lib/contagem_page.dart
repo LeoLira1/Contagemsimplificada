@@ -120,21 +120,42 @@ class _ContagemPageState extends State<ContagemPage>
   /// Se o dashboard subiu planilha nesse meio-tempo, o conferente contaria
   /// em cima de saldo velho — então recarrega ao voltar para a frente. Não
   /// recarrega no meio de uma gravação, para não trocar o card embaixo dela.
+  ///
+  /// Se ficou em segundo plano por mais de [_ociosoDemais], as conexões de
+  /// leitura são trocadas ANTES de recarregar: com a tela apagada, o Android
+  /// e a operadora derrubam os sockets guardados, e a recarga ficaria
+  /// pendurada num deles até estourar o prazo (ver
+  /// TursoService.renovarConexoesLeitura).
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _saiuEm ??= DateTime.now();
+      return;
+    }
     if (state != AppLifecycleState.resumed) return;
+    final saiuEm = _saiuEm;
+    _saiuEm = null;
+    final renovar =
+        saiuEm != null && DateTime.now().difference(saiuEm) > _ociosoDemais;
     // Voltar ao app é a hora mais provável de a rede ter voltado.
     _fila.tentarAgora();
-    if (!_carregando && _gravando.isEmpty) _carregar();
+    if (!_carregando && _gravando.isEmpty) _carregar(renovar: renovar);
   }
 
-  Future<void> _carregar() async {
+  /// Quando o app foi para segundo plano (null = está na frente).
+  DateTime? _saiuEm;
+  static const Duration _ociosoDemais = Duration(seconds: 10);
+
+  Future<void> _carregar({bool renovar = false}) async {
     setState(() {
       _carregando = true;
       _erro = null;
     });
 
-    final conectou = await TursoService().garantirConexao();
+    final conectou = renovar
+        ? await TursoService().renovarConexoesLeitura()
+        : await TursoService().garantirConexao();
     if (!mounted) return;
 
     if (!conectou) {
